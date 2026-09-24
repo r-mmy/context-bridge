@@ -1,6 +1,10 @@
 # Security policy
 
-Context Bridge v0.1 is a local, read-only project inspection service. Report vulnerabilities privately to the project maintainers before publishing details. Do not include real credentials or private project contents in reports.
+## Report a vulnerability
+
+Open the repository's [Security Advisories page](https://github.com/r-mmy/context-bridge/security/advisories) and select **Report a vulnerability** to send a private report to the maintainers. Private vulnerability reporting is enabled for this repository. Do not open a public issue or pull request with vulnerability details. Do not include real credentials or unrelated private project contents in a report. See GitHub's [private vulnerability reporting guide](https://docs.github.com/en/code-security/how-tos/report-and-fix-vulnerabilities/report-privately) for details.
+
+Context Bridge v0.1 is a local, read-only project inspection service.
 
 ## Access boundary
 

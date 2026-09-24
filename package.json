@@ -4,6 +4,14 @@
   "private": true,
   "description": "Read-only local project context for MCP-compatible assistants",
   "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/r-mmy/context-bridge.git"
+  },
+  "homepage": "https://github.com/r-mmy/context-bridge#readme",
+  "bugs": {
+    "url": "https://github.com/r-mmy/context-bridge/issues"
+  },
   "type": "module",
   "bin": {
     "ctxbridge": "dist/cli/main.js"

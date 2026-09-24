@@ -11,15 +11,21 @@ ChatGPT
   → Context Bridge
 ```
 
-1. Install Context Bridge and register the projects you want available:
+1. Use Node.js 20 or newer and pnpm 12.4.2 (the version pinned by this
+   repository). From a cloned Context Bridge checkout, install it from source
+   and register the projects you want available:
 
    ```sh
-   pnpm install
+   pnpm install --frozen-lockfile
    pnpm build
    pnpm add -g .
    ctxbridge init
-   ctxbridge project add <path>
+   ctxbridge project add /path/to/project
+   ctxbridge doctor
    ```
+
+   On Windows PowerShell, a project path can look like
+   `C:\code\my-project`.
 
 2. Configure the tunnel client to launch the local stdio server with command
    `ctxbridge` and arguments `mcp --stdio`. Follow the tunnel provider's current

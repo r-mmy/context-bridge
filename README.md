@@ -1,85 +1,85 @@
 # Context Bridge
 
-Context Bridge is a read-only MCP server and CLI for sharing approved local development projects with AI assistants. It lets MCP-compatible clients inspect files and Git history from the same live filesystem without granting a general shell or arbitrary filesystem access.
+**Read-only local project context for ChatGPT, Codex, and other MCP-compatible assistants.**
 
-## v0.1 trust model
+Context Bridge lets an assistant inspect files and Git history from projects you explicitly register. Use it when you want an assistant to review your working tree without giving it a general shell or access to the rest of your filesystem. In v0.1, MCP tools cannot modify project files or run arbitrary shell commands. Context Bridge itself has no telemetry or hosted backend.
 
-Only project roots registered by the user are available. MCP clients address them by project ID and use project-relative paths. The server has no file-writing, arbitrary command, commit, or agent-execution tools. It has no telemetry or cloud dependency. The CLI writes only the local project registry when you initialize or change registrations.
+[![CI](https://github.com/r-mmy/context-bridge/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/r-mmy/context-bridge/actions/workflows/ci.yml) [![License](https://img.shields.io/github/license/r-mmy/context-bridge)](LICENSE)
 
-File and Git results use the same path containment, ignore, and sensitive-file rules. Git stays inside the registered root even when that root is nested in a larger worktree. MCP-facing Git reads disable transport protocols and lazy fetching; a partial clone with a missing local object can return an error. `.gitignore` is honored by default; `.contextbridgeignore` can add patterns or re-include ordinary ignored files. Ignore files are contained and size-limited. The built-in secret denylist cannot be overridden, and Windows alternate data streams are unsupported. See [SECURITY.md](SECURITY.md) for exact limits and known constraints.
+- [Quick start](#quick-start)
+- [How it works](#how-it-works)
+- [Connect Codex](docs/codex-mcp-setup.md) · [Connect ChatGPT through Secure MCP Tunnel](docs/chatgpt-secure-mcp-tunnel.md)
+- [Security policy](SECURITY.md) · [Security model](docs/security-model.md)
 
-## Requirements
+## What v0.1 provides
 
-- Node.js 20 or newer
-- pnpm
-- Git for Git tools; file tools also work for non-Git directories
-- Optional: [ripgrep](https://github.com/BurntSushi/ripgrep) for faster searches of an individual file; directory searches use a bounded native walk
+- Explicit project registration; MCP tools select a project by ID and use project-relative paths.
+- Bounded file listing, search, and text reads.
+- Git repository status, diffs, logs, and show results.
+- Shared `.gitignore`, `.contextbridgeignore`, and built-in sensitive-path filtering for file and Git results.
+- Local stdio MCP for Codex and other clients, plus loopback-only Streamable HTTP.
+- A ChatGPT workflow through Secure MCP Tunnel. The tunnel is an external connection service; Context Bridge itself does not provide a cloud backend.
+- A read-only MCP tool surface with no telemetry, file-write tools, arbitrary shell, or agent-task dispatch.
 
-## Develop locally
+## Quick start
+
+Install Node.js 20 or newer and pnpm 12.4.2, the version pinned by this repository. Git is needed for Git tools; file tools also work in non-Git directories.
+
+Context Bridge is installed from source for v0.1.0. It is intentionally private and is not published to npm.
 
 ```sh
-pnpm install
+git clone https://github.com/r-mmy/context-bridge.git
+cd context-bridge
+pnpm install --frozen-lockfile
 pnpm build
-pnpm lint
-pnpm format:check
-pnpm typecheck
-pnpm test
-```
-
-The checkout exposes the CLI through pnpm scripts:
-
-```sh
-pnpm ctxbridge --help
-pnpm ctxbridge init
-pnpm ctxbridge project add .
-pnpm ctxbridge project list
-pnpm ctxbridge doctor
-```
-
-To start a server from the checkout:
-
-```sh
-pnpm ctxbridge mcp --stdio
-pnpm ctxbridge mcp --http --port 7331
-```
-
-The HTTP endpoint binds only to `127.0.0.1` and serves `/mcp`. It validates Host and Origin headers. It does not accept a bearer token in v0.1.
-
-## Register a project
-
-```sh
+pnpm add -g .
 ctxbridge init
-ctxbridge project add C:\\code\\my-project
-ctxbridge project list
-ctxbridge project show my-project
-ctxbridge project remove my-project
+ctxbridge project add /path/to/project
+ctxbridge doctor
 ```
 
-If `project add` has no path, it registers the current directory. IDs are generated from the folder name, made unique with a numeric suffix when needed, and stay stable after registration. The registry is stored under the operating system's per-user config directory. Only the CLI displays the saved absolute root; MCP responses do not.
+On Windows PowerShell, register a project with a Windows path, for example:
 
-`ctxbridge doctor` checks the Node version, Git availability, registry, and registered roots. Removing a project removes its registry entry only.
-
-## Connect an MCP client
-
-For a local process client, configure the command and arguments:
-
-```json
-{
-  "mcpServers": {
-    "context-bridge": {
-      "command": "ctxbridge",
-      "args": ["mcp", "--stdio"]
-    }
-  }
-}
+```powershell
+ctxbridge project add C:\code\my-project
 ```
 
-If running directly from this checkout, replace `ctxbridge` with the absolute path to Node and pass the built `dist/cli/main.js` path followed by `mcp --stdio` as arguments. See [Codex MCP setup](docs/codex-mcp-setup.md).
+If `ctxbridge` is not found after installation, run `pnpm setup` to configure pnpm's global executable directory, then open a new terminal.
 
-ChatGPT cannot launch a local process directly. The recommended connection uses Secure MCP Tunnel to launch Context Bridge over stdio; local Streamable HTTP remains available for tunnel configurations that require HTTP. See [ChatGPT setup](docs/chatgpt-secure-mcp-tunnel.md).
+To register the current directory, run `ctxbridge project add` without a path. Use `ctxbridge project list` to see registered IDs. Removing a registration removes only its local registry entry.
 
-## Architecture
+## How it works
 
-The one-package codebase separates CLI and registry management from project resolution, security policy, filesystem reads, Git reads, MCP tool definitions, and transport startup. Both transports use the same MCP server factory and tools. The portable files under `plugin/` contain the stdio MCP configuration and the project-context skill; the core server remains usable by any MCP-compatible client.
+```text
+User: "Review what changed in my project."
+                 │
+        ChatGPT via Secure MCP Tunnel
+        or Codex via local stdio MCP
+                 │
+                 ▼
+       Context Bridge on this computer
+          ├─ projects_list / project_get
+          ├─ files_list / files_search / file_read
+          └─ git_status / git_diff / git_log / git_show
+                 │
+                 ▼
+        explicitly registered project
+```
 
-Read [architecture](docs/architecture.md), [security model](docs/security-model.md), and [contributing](CONTRIBUTING.md) before changing the access boundary.
+The assistant uses returned context to answer you. Context Bridge v0.1 does not dispatch coding tasks to Codex or edit the project.
+
+## Connect an assistant
+
+- **Codex:** follow the [local MCP setup](docs/codex-mcp-setup.md).
+- **ChatGPT:** follow [ChatGPT through Secure MCP Tunnel](docs/chatgpt-secure-mcp-tunnel.md). ChatGPT does not launch a local process directly.
+- **Other clients:** configure the stdio command `ctxbridge` with arguments `mcp --stdio`. For clients that require HTTP, run `ctxbridge mcp --http --port 7331`; it listens on `127.0.0.1` and validates Host and Origin.
+
+## Security and trust
+
+Only roots registered locally by the user are available to MCP. File and Git operations share the same containment, ignore, and sensitive-file policy; absolute project paths are not returned in MCP results. The CLI writes only local registry data when you initialize or manage registrations.
+
+Read the [security policy](SECURITY.md) for exact defaults, resource bounds, and limitations, including same-user filesystem races and loopback HTTP authentication. See the [security model](docs/security-model.md) for implementation details.
+
+## Development and contributing
+
+See [contributing](CONTRIBUTING.md) for setup and validation commands, and [architecture](docs/architecture.md) for the code layout. The CI matrix covers Windows, Ubuntu, and macOS on Node.js 20 and 24.

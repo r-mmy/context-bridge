@@ -4,10 +4,10 @@ Context Bridge is a small TypeScript package. Keep filesystem policy, Git access
 
 ## Setup
 
-Use Node.js 20 or newer and pnpm:
+Use Node.js 20 or newer and pnpm 12.4.2, the version pinned by this repository:
 
 ```sh
-pnpm install
+pnpm install --frozen-lockfile
 pnpm build
 pnpm lint
 pnpm format:check
