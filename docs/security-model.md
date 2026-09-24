@@ -1,0 +1,9 @@
+# Security model
+
+The server grants read access only to roots explicitly registered by the user. Project IDs are the only project selector exposed over MCP. Every path is normalized relative to its registered root, canonicalized on disk when it exists, checked for containment, and passed through shared ignore and sensitive-file policy before data is returned.
+
+The policy applies equally to filesystem and Git tools. Git worktree roots and both Git metadata directories are canonicalized and must remain inside the discovered worktree; external `.git` pointers and linked worktrees with shared metadata elsewhere are rejected. For a nested registered root, Git pathspecs include the root's worktree-relative prefix; output paths are mapped back to paths relative to the registered root. Unscoped status, diff, log, show, and untracked-file operations are restricted to that prefix. Diffs are assembled one path at a time with rename detection disabled, so a rename cannot pair an in-root path with an out-of-root path. `git_show` without a path returns commit metadata and only allowed file patches; with a path it reads only that revision's selected in-scope blob after applying the same path checks.
+
+Git runs as a child process with a fixed argument vector, `shell: false`, a controlled environment, time and output caps, and no external diff, text conversion, fsmonitor, credential helpers, or clean/smudge/process filters. Git transports and lazy fetching are disabled for MCP-facing commands, so missing objects in a partial clone fail locally instead of triggering a fetch. Directory listing and search stream entries and stop at a per-call work budget; results follow filesystem iteration order and are not stable pagination. Text byte limits preserve UTF-8 boundaries.
+
+Default secret paths, ignore rules, limits, loopback HTTP protections, and the cross-platform filesystem race limitation are documented in [SECURITY.md](../SECURITY.md).

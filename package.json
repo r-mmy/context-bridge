@@ -1,0 +1,45 @@
+{
+  "name": "context-bridge-dev",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Read-only local project context for MCP-compatible assistants",
+  "license": "Apache-2.0",
+  "type": "module",
+  "bin": {
+    "ctxbridge": "dist/cli/main.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "packageManager": "pnpm@11.19.0",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/cli/main.ts",
+    "ctxbridge": "tsx src/cli/main.ts",
+    "test": "vitest run --testTimeout=30000",
+    "test:watch": "vitest",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit",
+    "lint": "eslint src tests eslint.config.mjs",
+    "format": "prettier --write package.json pnpm-workspace.yaml tsconfig.json tsconfig.test.json .prettierrc.json eslint.config.mjs README.md SECURITY.md CONTRIBUTING.md docs plugin src tests .github",
+    "format:check": "prettier --check package.json pnpm-workspace.yaml tsconfig.json tsconfig.test.json .prettierrc.json eslint.config.mjs README.md SECURITY.md CONTRIBUTING.md docs plugin src tests .github"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/node": "^2.1.0",
+    "@modelcontextprotocol/server": "^2.1.0",
+    "ignore": "^7.0.5",
+    "picomatch": "^4.0.3",
+    "zod": "^4.1.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@modelcontextprotocol/client": "2.1.0",
+    "@types/node": "^20.19.43",
+    "@types/picomatch": "^4.0.3",
+    "eslint": "^10.11.0",
+    "prettier": "^3.8.0",
+    "tsx": "^4.20.0",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.70.1",
+    "vitest": "^4.0.0"
+  }
+}
