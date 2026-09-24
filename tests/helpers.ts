@@ -1,6 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { realpathSync } from "node:fs";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, realpath, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { ProjectRecord } from "../src/projects/registry.js";
@@ -11,11 +10,20 @@ export async function makeTempDirectory(
   return await mkdtemp(path.join(os.tmpdir(), prefix));
 }
 
-export function projectAt(root: string, id = "test-project"): ProjectRecord {
+export async function projectAt(
+  root: string,
+  id = "test-project",
+): Promise<ProjectRecord> {
   let canonicalRoot: string;
   try {
-    canonicalRoot = realpathSync(root);
-  } catch {
+    canonicalRoot = await realpath(root);
+  } catch (error) {
+    if (
+      !(error instanceof Error) ||
+      !("code" in error) ||
+      (error.code !== "ENOENT" && error.code !== "ENOTDIR")
+    )
+      throw error;
     canonicalRoot = path.resolve(root);
   }
   return {

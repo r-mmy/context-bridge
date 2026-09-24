@@ -20,7 +20,7 @@ import { makeTempDirectory, git, projectAt, removeTree } from "./helpers.js";
 
 const temporary: string[] = [];
 
-async function makeGitProject(): Promise<ReturnType<typeof projectAt>> {
+async function makeGitProject(): ReturnType<typeof projectAt> {
   const root = await makeTempDirectory("ctxbridge-git-");
   temporary.push(root);
   git(root, ["init", "-q"]);
@@ -32,11 +32,11 @@ async function makeGitProject(): Promise<ReturnType<typeof projectAt>> {
   await writeFile(path.join(root, ".gitattributes"), "*.txt text\n");
   git(root, ["add", "--", "safe.txt", ".env", ".gitattributes"]);
   git(root, ["commit", "-q", "-m", "initial project state"]);
-  return projectAt(root);
+  return await projectAt(root);
 }
 
 async function makeNestedGitProject(): Promise<{
-  project: ReturnType<typeof projectAt>;
+  project: Awaited<ReturnType<typeof projectAt>>;
   repositoryRoot: string;
 }> {
   const repositoryRoot = await makeTempDirectory("ctxbridge-parent-git-");
@@ -61,7 +61,7 @@ async function makeNestedGitProject(): Promise<{
   );
   git(repositoryRoot, ["add", "--", "allowed", "sibling-secret.txt"]);
   git(repositoryRoot, ["commit", "-q", "-m", "initial nested project state"]);
-  return { project: projectAt(allowedRoot), repositoryRoot };
+  return { project: await projectAt(allowedRoot), repositoryRoot };
 }
 
 afterEach(async () => {
@@ -222,7 +222,7 @@ describe("read-only Git interface", () => {
     await writeFile(path.join(root, "safe.txt"), "unstaged replacement\n");
     await writeFile(path.join(root, "loose.txt"), "untracked line\n");
 
-    const project = projectAt(root);
+    const project = await projectAt(root);
     const branch = git(root, ["symbolic-ref", "--short", "HEAD"]).trim();
     const status = await getGitStatus(project);
     expect(status.branch).toBe(branch);
@@ -475,7 +475,7 @@ describe("read-only Git interface", () => {
       path.join(registeredRoot, ".git"),
       `gitdir: ${path.join(outsideRepository, ".git").replace(/\\/g, "/")}\n`,
     );
-    const project = projectAt(registeredRoot);
+    const project = await projectAt(registeredRoot);
 
     await expect(isGitRepository(project)).resolves.toBe(false);
     await expect(getGitShow(project, { revision })).rejects.toMatchObject({
@@ -756,7 +756,7 @@ describe("read-only Git interface", () => {
       const before = await packInventory();
 
       await expect(
-        getGitShow(projectAt(cloneRoot), { revision, path: "safe.txt" }),
+        getGitShow(await projectAt(cloneRoot), { revision, path: "safe.txt" }),
       ).rejects.toMatchObject({ code: "git_error" });
 
       expect(requestCount).toBe(0);
@@ -772,13 +772,13 @@ describe("read-only Git interface", () => {
   it("handles non-Git projects and missing roots", async () => {
     const root = await makeTempDirectory("ctxbridge-not-git-");
     temporary.push(root);
-    const project = projectAt(root);
+    const project = await projectAt(root);
     await expect(isGitRepository(project)).resolves.toBe(false);
     await expect(getGitStatus(project)).rejects.toMatchObject({
       code: "git_error",
     });
 
-    const missing = projectAt(path.join(root, "missing"));
+    const missing = await projectAt(path.join(root, "missing"));
     await expect(getGitStatus(missing)).rejects.toBeDefined();
   });
 });

@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -51,7 +51,7 @@ describe.sequential("CLI", () => {
     expect(output.join("")).not.toContain(io.cwd);
     output.length = 0;
     expect(await runCli(["project", "show", "demo-project"], io)).toBe(0);
-    expect(output.join("")).toContain(io.cwd);
+    expect(output.join("")).toContain(await realpath(io.cwd));
     output.length = 0;
     expect(await runCli(["project", "remove", "demo-project"], io)).toBe(0);
     expect(output.join("")).toContain("Project files were not changed");

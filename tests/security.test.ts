@@ -9,10 +9,10 @@ import { makeTempDirectory, projectAt, removeTree } from "./helpers.js";
 
 const temporary: string[] = [];
 
-async function makeProject(): Promise<ReturnType<typeof projectAt>> {
+async function makeProject(): ReturnType<typeof projectAt> {
   const root = await makeTempDirectory();
   temporary.push(root);
-  return projectAt(root);
+  return await projectAt(root);
 }
 
 afterEach(async () => {
@@ -48,7 +48,7 @@ describe("project path boundary", () => {
     await writeFile(path.join(sensitiveRoot, "adc.json"), "PRIVATE_ADC_MARKER");
     await writeFile(path.join(ordinaryRoot, "main.ts"), "ordinary source");
 
-    const sensitiveProject = projectAt(sensitiveRoot);
+    const sensitiveProject = await projectAt(sensitiveRoot);
     await expect(
       resolveProjectPath(sensitiveProject, "adc.json"),
     ).rejects.toMatchObject({ code: "path_denied" });
@@ -62,7 +62,7 @@ describe("project path boundary", () => {
       searchFiles(sensitiveProject, { query: "PRIVATE_ADC_MARKER" }),
     ).rejects.toMatchObject({ code: "path_denied" });
 
-    const ordinaryProject = projectAt(ordinaryRoot);
+    const ordinaryProject = await projectAt(ordinaryRoot);
     await expect(
       readTextFile(ordinaryProject, "main.ts"),
     ).resolves.toMatchObject({ text: "ordinary source" });
