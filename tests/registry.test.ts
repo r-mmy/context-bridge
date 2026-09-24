@@ -1,4 +1,4 @@
-import { mkdir } from "node:fs/promises";
+import { mkdir, realpath } from "node:fs/promises";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
@@ -51,7 +51,7 @@ describe.sequential("project registry", () => {
     ).toEqual(["anime-swarm", "anime-swarm-2"]);
     expect(await getProject(first.id)).toMatchObject({
       id: first.id,
-      root: one,
+      root: first.root,
     });
     await removeProject(first.id);
     expect(
@@ -110,7 +110,7 @@ describe.sequential("project registry", () => {
       code: "sensitive_project_root",
     });
     const ordinary = await addProject(ordinaryConfigProject);
-    expect(ordinary.root).toBe(ordinaryConfigProject);
+    expect(ordinary.root).toBe(await realpath(ordinaryConfigProject));
 
     await writeRegistry({
       version: 1,
@@ -118,7 +118,7 @@ describe.sequential("project registry", () => {
         {
           id: "legacy-sensitive",
           name: "account",
-          root: cloudSubtree,
+          root: await realpath(cloudSubtree),
           addedAt: new Date(0).toISOString(),
         },
       ],

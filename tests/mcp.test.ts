@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import {
@@ -210,7 +210,7 @@ describe.sequential("MCP contract", () => {
         {
           id: "legacy-account",
           name: "account",
-          root: projectRoot,
+          root: await realpath(projectRoot),
           addedAt: new Date(0).toISOString(),
         },
       ],

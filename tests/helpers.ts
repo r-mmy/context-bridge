@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { realpathSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -11,10 +12,16 @@ export async function makeTempDirectory(
 }
 
 export function projectAt(root: string, id = "test-project"): ProjectRecord {
+  let canonicalRoot: string;
+  try {
+    canonicalRoot = realpathSync(root);
+  } catch {
+    canonicalRoot = path.resolve(root);
+  }
   return {
     id,
-    name: path.basename(root),
-    root,
+    name: path.basename(canonicalRoot),
+    root: canonicalRoot,
     addedAt: new Date(0).toISOString(),
   };
 }
