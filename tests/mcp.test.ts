@@ -20,6 +20,7 @@ import { createHttpServer, listenHttpServer } from "../src/transports/http.js";
 const roots: string[] = [];
 const oldAppData = process.env.APPDATA;
 const oldXdg = process.env.XDG_CONFIG_HOME;
+const oldHome = process.env.HOME;
 
 afterEach(async () => {
   await Promise.all(
@@ -29,6 +30,8 @@ afterEach(async () => {
   else process.env.APPDATA = oldAppData;
   if (oldXdg === undefined) delete process.env.XDG_CONFIG_HOME;
   else process.env.XDG_CONFIG_HOME = oldXdg;
+  if (oldHome === undefined) delete process.env.HOME;
+  else process.env.HOME = oldHome;
 });
 
 describe.sequential("MCP contract", () => {
@@ -37,6 +40,7 @@ describe.sequential("MCP contract", () => {
     roots.push(base);
     process.env.APPDATA = path.join(base, "appdata");
     process.env.XDG_CONFIG_HOME = path.join(base, "xdg");
+    process.env.HOME = base;
     await ensureRegistry();
     const projectRoot = path.join(base, "registered-project");
     await mkdir(projectRoot);
@@ -134,6 +138,7 @@ describe.sequential("MCP contract", () => {
     roots.push(base);
     process.env.APPDATA = path.join(base, "appdata");
     process.env.XDG_CONFIG_HOME = path.join(base, "xdg");
+    process.env.HOME = base;
     await ensureRegistry();
     const projectRoot = path.join(base, "registered-project");
     await mkdir(projectRoot);
@@ -194,6 +199,7 @@ describe.sequential("MCP contract", () => {
     roots.push(base);
     process.env.APPDATA = path.join(base, "appdata");
     process.env.XDG_CONFIG_HOME = path.join(base, "xdg");
+    process.env.HOME = base;
     await ensureRegistry();
     const projectRoot = path.join(
       base,
@@ -253,6 +259,7 @@ describe.sequential("MCP contract", () => {
     roots.push(base);
     process.env.APPDATA = path.join(base, "appdata");
     process.env.XDG_CONFIG_HOME = path.join(base, "xdg");
+    process.env.HOME = base;
     await ensureRegistry();
     const env: Record<string, string> = {};
     for (const [key, value] of Object.entries(process.env)) {

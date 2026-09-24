@@ -7,6 +7,7 @@ import { runCli } from "../src/cli/commands.js";
 const roots: string[] = [];
 const oldAppData = process.env.APPDATA;
 const oldXdg = process.env.XDG_CONFIG_HOME;
+const oldHome = process.env.HOME;
 
 afterEach(async () => {
   await Promise.all(
@@ -16,6 +17,8 @@ afterEach(async () => {
   else process.env.APPDATA = oldAppData;
   if (oldXdg === undefined) delete process.env.XDG_CONFIG_HOME;
   else process.env.XDG_CONFIG_HOME = oldXdg;
+  if (oldHome === undefined) delete process.env.HOME;
+  else process.env.HOME = oldHome;
 });
 
 describe.sequential("CLI", () => {
@@ -24,6 +27,7 @@ describe.sequential("CLI", () => {
     roots.push(root);
     process.env.APPDATA = path.join(root, "appdata");
     process.env.XDG_CONFIG_HOME = path.join(root, "xdg");
+    process.env.HOME = root;
     const output: string[] = [];
     const errors: string[] = [];
     const io = {
@@ -82,6 +86,7 @@ describe.sequential("CLI", () => {
     roots.push(base);
     process.env.APPDATA = path.join(base, "appdata");
     process.env.XDG_CONFIG_HOME = path.join(base, "xdg");
+    process.env.HOME = base;
     const sensitiveRoot = path.join(
       base,
       ".config",

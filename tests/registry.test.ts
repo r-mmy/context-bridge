@@ -14,6 +14,7 @@ import { makeTempDirectory, removeTree } from "./helpers.js";
 const temporary: string[] = [];
 const oldAppData = process.env.APPDATA;
 const oldXdg = process.env.XDG_CONFIG_HOME;
+const oldHome = process.env.HOME;
 let configRoot: string;
 
 afterEach(async () => {
@@ -22,6 +23,8 @@ afterEach(async () => {
   else process.env.APPDATA = oldAppData;
   if (oldXdg === undefined) delete process.env.XDG_CONFIG_HOME;
   else process.env.XDG_CONFIG_HOME = oldXdg;
+  if (oldHome === undefined) delete process.env.HOME;
+  else process.env.HOME = oldHome;
 });
 
 describe.sequential("project registry", () => {
@@ -30,6 +33,7 @@ describe.sequential("project registry", () => {
     temporary.push(configRoot);
     process.env.APPDATA = path.join(configRoot, "appdata");
     process.env.XDG_CONFIG_HOME = path.join(configRoot, "xdg");
+    process.env.HOME = configRoot;
     await ensureRegistry();
 
     const parentA = await makeTempDirectory("ctxbridge-a-");
@@ -65,6 +69,7 @@ describe.sequential("project registry", () => {
     temporary.push(config, rootParent);
     process.env.APPDATA = path.join(config, "appdata");
     process.env.XDG_CONFIG_HOME = path.join(config, "xdg");
+    process.env.HOME = config;
     await ensureRegistry();
     const root = path.join(rootParent, "repo");
     await mkdir(root);
@@ -81,6 +86,7 @@ describe.sequential("project registry", () => {
     temporary.push(config, base);
     process.env.APPDATA = path.join(config, "appdata");
     process.env.XDG_CONFIG_HOME = path.join(config, "xdg");
+    process.env.HOME = config;
     await ensureRegistry();
 
     const sshRoot = path.join(base, ".ssh");
