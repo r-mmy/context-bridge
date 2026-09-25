@@ -27,3 +27,9 @@ export function getConfigDirectory(
 export function getRegistryPath(env: NodeJS.ProcessEnv = process.env): string {
   return path.join(getConfigDirectory(env), "projects.json");
 }
+
+export function getAgentPolicyPath(
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  return path.join(getConfigDirectory(env), "agent-policy.json");
+}

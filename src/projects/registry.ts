@@ -28,7 +28,12 @@ export interface ProjectRegistry {
 
 const EMPTY_REGISTRY: ProjectRegistry = { version: 1, projects: [] };
 
-function normalizeForComparison(value: string): string {
+/**
+ * Match the registry's existing path identity rules: resolve lexical segments,
+ * fold case on Windows, and preserve case on POSIX systems. Callers binding an
+ * authorization must supply the canonical root returned by getProject().
+ */
+export function normalizeProjectRootForIdentity(value: string): string {
   const normalized = path.resolve(value);
   return process.platform === "win32"
     ? normalized.toLocaleLowerCase("en-US")
@@ -200,10 +205,11 @@ export async function addProject(pathInput: string): Promise<ProjectRecord> {
     );
 
   const registry = await readRegistry();
-  const normalizedRoot = normalizeForComparison(root);
+  const normalizedRoot = normalizeProjectRootForIdentity(root);
   if (
     registry.projects.some(
-      (project) => normalizeForComparison(project.root) === normalizedRoot,
+      (project) =>
+        normalizeProjectRootForIdentity(project.root) === normalizedRoot,
     )
   ) {
     throw new ContextBridgeError(
@@ -271,7 +277,8 @@ export async function getProject(id: string): Promise<ProjectRecord> {
     );
   }
   if (
-    normalizeForComparison(actualRoot) !== normalizeForComparison(project.root)
+    normalizeProjectRootForIdentity(actualRoot) !==
+    normalizeProjectRootForIdentity(project.root)
   ) {
     throw new ContextBridgeError(
       "project_root_changed",
