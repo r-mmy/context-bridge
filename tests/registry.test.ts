@@ -1,6 +1,7 @@
-import { mkdir, realpath } from "node:fs/promises";
+import { mkdir, realpath, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { getRegistryPath } from "../src/config/paths.js";
 import {
   addProject,
   ensureRegistry,
@@ -28,6 +29,31 @@ afterEach(async () => {
 });
 
 describe.sequential("project registry", () => {
+  it("reads legacy projects.json v1 entries without registration IDs", async () => {
+    const config = await makeTempDirectory("ctxbridge-config-legacy-v1-");
+    temporary.push(config);
+    process.env.APPDATA = path.join(config, "appdata");
+    process.env.XDG_CONFIG_HOME = path.join(config, "xdg");
+    process.env.HOME = config;
+    await mkdir(path.dirname(getRegistryPath()), { recursive: true });
+    const legacy = {
+      version: 1,
+      projects: [
+        {
+          id: "legacy-project",
+          name: "legacy-project",
+          root: path.resolve(config),
+          addedAt: new Date(0).toISOString(),
+        },
+      ],
+    };
+    await writeFile(getRegistryPath(), JSON.stringify(legacy), "utf8");
+
+    const registry = await readRegistry();
+    expect(registry.version).toBe(1);
+    expect(registry.projects).toEqual(legacy.projects);
+  });
+
   it("initializes, generates stable unique IDs, rejects duplicates, and removes registrations only", async () => {
     configRoot = await makeTempDirectory("ctxbridge-config-");
     temporary.push(configRoot);
@@ -47,6 +73,10 @@ describe.sequential("project registry", () => {
     const second = await addProject(two);
     expect(first.id).toBe("anime-swarm");
     expect(second.id).toBe("anime-swarm-2");
+    expect(first.registrationId).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+    );
+    expect(second.registrationId).not.toBe(first.registrationId);
     await expect(addProject(one)).rejects.toMatchObject({
       code: "project_already_registered",
     });

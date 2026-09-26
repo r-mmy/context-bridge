@@ -38,6 +38,9 @@
     "picomatch": "^4.0.3",
     "zod": "^4.1.0"
   },
+  "optionalDependencies": {
+    "fs-ext-extra-prebuilt": "2.2.14"
+  },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
     "@modelcontextprotocol/client": "2.1.0",

@@ -1,5 +1,6 @@
 allowBuilds:
   esbuild: true
+  fs-ext-extra-prebuilt: false
 minimumReleaseAgeExclude:
   - "@modelcontextprotocol/core@2.1.0"
   - "@modelcontextprotocol/node@2.1.0"

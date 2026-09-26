@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { getAgentPolicyPath } from "../src/config/paths.js";
-import { readAgentPolicy } from "../src/agents/policy.js";
+import { readAgentPolicy, writeAgentPolicy } from "../src/agents/policy.js";
 import type { AgentAdapter } from "../src/agents/adapter.js";
 import { AgentAdapterError } from "../src/agents/errors.js";
 import { runCli, type CliIO } from "../src/cli/commands.js";
@@ -406,19 +406,30 @@ describe.sequential("agent M1 CLI", () => {
     const root = await setupConfig();
     const { id, projectRoot } = await registerProject(root, "reused-project");
     await enableProject(id, root);
-    const firstRegistration = (await readRegistry()).projects[0]?.addedAt;
-    expect(firstRegistration).toBeDefined();
+    const firstRegistration = (await readRegistry()).projects[0];
+    const oldAuthorization = (await readAgentPolicy()).projects[id];
+    expect(firstRegistration?.registrationId).toBeDefined();
+    expect(oldAuthorization?.registration_id).toBe(
+      firstRegistration?.registrationId,
+    );
 
     expect(await runCli(["project", "remove", id], testIO(root))).toBe(0);
     const removedStatus = testIO(root);
     expect(await runCli(["agent", "status", id], removedStatus)).toBe(0);
     expect(removedStatus.output.join("")).toContain("not registered");
 
-    await new Promise((resolve) => setTimeout(resolve, 10));
     expect(await runCli(["project", "add", projectRoot], testIO(root))).toBe(0);
-    const secondRegistration = (await readRegistry()).projects[0]?.addedAt;
+    const changedRegistry = await readRegistry();
+    const secondRegistration = changedRegistry.projects[0];
     expect(secondRegistration).toBeDefined();
-    expect(secondRegistration).not.toBe(firstRegistration);
+    if (!firstRegistration || !secondRegistration)
+      throw new Error("test project registration missing");
+    secondRegistration.addedAt = firstRegistration.addedAt;
+    await writeRegistry(changedRegistry);
+    expect(secondRegistration.addedAt).toBe(firstRegistration.addedAt);
+    expect(secondRegistration.registrationId).not.toBe(
+      firstRegistration.registrationId,
+    );
 
     const reRegisteredStatus = testIO(root);
     expect(await runCli(["agent", "status", id], reRegisteredStatus)).toBe(0);
@@ -428,6 +439,50 @@ describe.sequential("agent M1 CLI", () => {
     expect(reRegisteredStatus.output.join("")).toContain(
       "Registration identity: stale",
     );
+    const reEnabled = testIO(root, async () => true);
+    expect(await runCli(["agent", "enable", id], reEnabled)).toBe(0);
+    const newAuthorization = (await readAgentPolicy()).projects[id];
+    expect(newAuthorization?.enabled).toBe(true);
+    expect(newAuthorization?.registration_id).toBe(
+      secondRegistration.registrationId,
+    );
+    expect(newAuthorization?.registration_id).not.toBe(
+      oldAuthorization?.registration_id,
+    );
+  });
+
+  it("fails closed on legacy registry and policy records until explicit re-enable", async () => {
+    const root = await setupConfig();
+    const { id } = await registerProject(root, "legacy-registration");
+    await enableProject(id, root);
+
+    const registry = await readRegistry();
+    const project = registry.projects.find((entry) => entry.id === id);
+    expect(project?.registrationId).toBeDefined();
+    if (!project) throw new Error("test project registration missing");
+    delete project.registrationId;
+    await writeRegistry(registry);
+
+    const policy = await readAgentPolicy();
+    const authorization = policy.projects[id];
+    expect(authorization).toBeDefined();
+    if (!authorization) throw new Error("test authorization missing");
+    delete authorization.registration_id;
+    await writeAgentPolicy(policy);
+
+    const stale = testIO(root);
+    expect(await runCli(["agent", "status", id], stale)).toBe(0);
+    expect(stale.output.join("")).toContain("Authorization: disabled");
+    expect(stale.output.join("")).toContain("Registration identity: stale");
+
+    await enableProject(id, root);
+    const migrated = (await readRegistry()).projects[0];
+    const migratedAuthorization = (await readAgentPolicy()).projects[id];
+    expect(migrated?.registrationId).toBeDefined();
+    expect(migratedAuthorization?.registration_id).toBe(
+      migrated?.registrationId,
+    );
+    expect(migratedAuthorization?.registration_id).not.toBeUndefined();
   });
 
   it("reports M1 policy diagnostics without claiming App Server readiness", async () => {

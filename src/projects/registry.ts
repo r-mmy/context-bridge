@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { constants } from "node:fs";
 import {
+  lstat,
   mkdir,
   open,
   readFile,
@@ -11,6 +11,7 @@ import {
 } from "node:fs/promises";
 import path from "node:path";
 import { getConfigDirectory, getRegistryPath } from "../config/paths.js";
+import { withConfigMutationLock } from "../locks/file-lock.js";
 import { ContextBridgeError } from "../security/errors.js";
 import { isSensitiveProjectRoot } from "../security/paths.js";
 
@@ -19,6 +20,8 @@ export interface ProjectRecord {
   name: string;
   root: string;
   addedAt: string;
+  /** Unique registration instance; optional only for pre-M3A registry v1 data. */
+  registrationId?: string;
 }
 
 export interface ProjectRegistry {
@@ -86,7 +89,12 @@ function parseRegistry(text: string): ProjectRegistry {
       typeof record.name !== "string" ||
       typeof record.root !== "string" ||
       !path.isAbsolute(record.root) ||
-      typeof record.addedAt !== "string"
+      typeof record.addedAt !== "string" ||
+      (record.registrationId !== undefined &&
+        (typeof record.registrationId !== "string" ||
+          !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+            record.registrationId,
+          )))
     ) {
       throw new ContextBridgeError(
         "invalid_registry",
@@ -98,40 +106,32 @@ function parseRegistry(text: string): ProjectRegistry {
       name: record.name,
       root: record.root,
       addedAt: record.addedAt,
+      ...(record.registrationId
+        ? { registrationId: record.registrationId }
+        : {}),
     });
   }
   return { version: 1, projects };
 }
 
 export async function ensureRegistry(): Promise<string> {
-  const directory = getConfigDirectory();
-  await mkdir(directory, { recursive: true, mode: 0o700 });
-  const registryPath = getRegistryPath();
-  try {
-    await open(
-      registryPath,
-      constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY,
-      0o600,
-    ).then(async (handle) => {
-      try {
-        await handle.writeFile(
-          `${JSON.stringify(EMPTY_REGISTRY, null, 2)}\n`,
-          "utf8",
-        );
-        await handle.sync();
-      } finally {
-        await handle.close();
-      }
-    });
-  } catch (error) {
-    if (
-      !(error instanceof Error) ||
-      !("code" in error) ||
-      error.code !== "EEXIST"
-    )
-      throw error;
-  }
-  return registryPath;
+  return withConfigMutationLock(async () => {
+    const directory = getConfigDirectory();
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+    const registryPath = getRegistryPath();
+    try {
+      await lstat(registryPath);
+    } catch (error) {
+      if (
+        !(error instanceof Error) ||
+        !("code" in error) ||
+        error.code !== "ENOENT"
+      )
+        throw error;
+      await persistRegistry(EMPTY_REGISTRY);
+    }
+    return registryPath;
+  });
 }
 
 export async function readRegistry(): Promise<ProjectRegistry> {
@@ -146,7 +146,7 @@ export async function readRegistry(): Promise<ProjectRegistry> {
   }
 }
 
-export async function writeRegistry(registry: ProjectRegistry): Promise<void> {
+async function persistRegistry(registry: ProjectRegistry): Promise<void> {
   const directory = getConfigDirectory();
   await mkdir(directory, { recursive: true, mode: 0o700 });
   const target = getRegistryPath();
@@ -170,6 +170,15 @@ export async function writeRegistry(registry: ProjectRegistry): Promise<void> {
     await rm(temporary, { force: true });
     throw error;
   }
+}
+
+/**
+ * Replace a complete registry snapshot while holding the global config lock.
+ * Production read-modify-write operations must read after acquiring that lock
+ * and use the private persist helper inside one transaction instead.
+ */
+export async function writeRegistry(registry: ProjectRegistry): Promise<void> {
+  await withConfigMutationLock(() => persistRegistry(registry));
 }
 
 export async function addProject(pathInput: string): Promise<ProjectRecord> {
@@ -204,59 +213,97 @@ export async function addProject(pathInput: string): Promise<ProjectRecord> {
       "This directory is inside a location protected by Context Bridge's built-in sensitive-path policy.",
     );
 
-  const registry = await readRegistry();
-  const normalizedRoot = normalizeProjectRootForIdentity(root);
-  if (
-    registry.projects.some(
-      (project) =>
-        normalizeProjectRootForIdentity(project.root) === normalizedRoot,
-    )
-  ) {
-    throw new ContextBridgeError(
-      "project_already_registered",
-      "This directory is already registered.",
-    );
-  }
+  return withConfigMutationLock(async () => {
+    const registry = await readRegistry();
+    const normalizedRoot = normalizeProjectRootForIdentity(root);
+    if (
+      registry.projects.some(
+        (project) =>
+          normalizeProjectRootForIdentity(project.root) === normalizedRoot,
+      )
+    ) {
+      throw new ContextBridgeError(
+        "project_already_registered",
+        "This directory is already registered.",
+      );
+    }
 
-  const displayName = (path.basename(root) || "Filesystem root").replace(
-    /[\\/]+/g,
-    "-",
-  );
-  const baseId = slugify(displayName);
-  let id = baseId;
-  let suffix = 2;
-  while (registry.projects.some((project) => project.id === id)) {
-    id = `${baseId}-${suffix}`;
-    suffix += 1;
-  }
-  const project: ProjectRecord = {
-    id,
-    name: displayName,
-    root,
-    addedAt: new Date().toISOString(),
-  };
-  registry.projects.push(project);
-  registry.projects.sort((left, right) => left.id.localeCompare(right.id));
-  await writeRegistry(registry);
-  return project;
+    const displayName = (path.basename(root) || "Filesystem root").replace(
+      /[\\/]+/g,
+      "-",
+    );
+    const baseId = slugify(displayName);
+    let id = baseId;
+    let suffix = 2;
+    while (registry.projects.some((project) => project.id === id)) {
+      id = `${baseId}-${suffix}`;
+      suffix += 1;
+    }
+    const project: ProjectRecord = {
+      id,
+      name: displayName,
+      root,
+      addedAt: new Date().toISOString(),
+      registrationId: randomUUID(),
+    };
+    registry.projects.push(project);
+    registry.projects.sort((left, right) => left.id.localeCompare(right.id));
+    await persistRegistry(registry);
+    return project;
+  });
 }
 
 export async function removeProject(id: string): Promise<ProjectRecord> {
-  const registry = await readRegistry();
-  const index = registry.projects.findIndex((project) => project.id === id);
-  if (index < 0)
-    throw new ContextBridgeError(
-      "project_not_found",
-      `No registered project has ID "${id}".`,
+  return withConfigMutationLock(async () => {
+    const registry = await readRegistry();
+    const index = registry.projects.findIndex((project) => project.id === id);
+    if (index < 0)
+      throw new ContextBridgeError(
+        "project_not_found",
+        `No registered project has ID "${id}".`,
+      );
+    const [removed] = registry.projects.splice(index, 1);
+    // Policy entries intentionally remain as stale records. This single
+    // atomic registry replacement is enough: after removal the policy is not
+    // registered, and a later add gets a new UUID before it can match again.
+    await persistRegistry(registry);
+    if (!removed)
+      throw new ContextBridgeError(
+        "project_not_found",
+        `No registered project has ID "${id}".`,
+      );
+    return removed;
+  });
+}
+
+export async function ensureProjectRegistrationIdentity(
+  expected: ProjectRecord,
+): Promise<ProjectRecord> {
+  return withConfigMutationLock(async () => {
+    const registry = await readRegistry();
+    const index = registry.projects.findIndex(
+      (project) => project.id === expected.id,
     );
-  const [removed] = registry.projects.splice(index, 1);
-  await writeRegistry(registry);
-  if (!removed)
-    throw new ContextBridgeError(
-      "project_not_found",
-      `No registered project has ID "${id}".`,
-    );
-  return removed;
+    const current = registry.projects[index];
+    if (
+      !current ||
+      current.addedAt !== expected.addedAt ||
+      current.registrationId !== expected.registrationId ||
+      normalizeProjectRootForIdentity(current.root) !==
+        normalizeProjectRootForIdentity(expected.root)
+    ) {
+      throw new ContextBridgeError(
+        "project_registration_changed",
+        "The project registration changed; no authorization was written.",
+      );
+    }
+    if (current.registrationId) return current;
+
+    const identified = { ...current, registrationId: randomUUID() };
+    registry.projects[index] = identified;
+    await persistRegistry(registry);
+    return identified;
+  });
 }
 
 export async function getProject(id: string): Promise<ProjectRecord> {

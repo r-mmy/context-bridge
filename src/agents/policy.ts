@@ -4,7 +4,9 @@ import { chmod, mkdir, open, readFile, rename, rm } from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
 import { getAgentPolicyPath, getConfigDirectory } from "../config/paths.js";
+import { withConfigMutationLock } from "../locks/file-lock.js";
 import {
+  ensureProjectRegistrationIdentity,
   getProject,
   normalizeProjectRootForIdentity,
   readRegistry,
@@ -30,6 +32,7 @@ const ProjectAuthorizationSchema = z
   .object({
     registration_added_at: z.string().datetime(),
     root_fingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+    registration_id: z.string().uuid().optional(),
     enabled: z.boolean(),
     allowed_profiles: z.array(ProfileNameSchema).min(1).max(256),
     default_profile: ProfileNameSchema.optional(),
@@ -118,9 +121,15 @@ function parsePolicy(value: unknown): AgentPolicy {
 
 function identityFor(
   project: ProjectRecord,
-): Pick<ProjectAuthorization, "registration_added_at" | "root_fingerprint"> {
+): Pick<
+  ProjectAuthorization,
+  "registration_added_at" | "root_fingerprint" | "registration_id"
+> {
   return {
     registration_added_at: project.addedAt,
+    ...(project.registrationId
+      ? { registration_id: project.registrationId }
+      : {}),
     root_fingerprint: createHash("sha256")
       .update(normalizeProjectRootForIdentity(project.root), "utf8")
       .digest("hex"),
@@ -131,8 +140,10 @@ export function authorizationMatchesProject(
   authorization: ProjectAuthorization,
   project: ProjectRecord,
 ): boolean {
+  if (!project.registrationId) return false;
   const identity = identityFor(project);
   return (
+    authorization.registration_id === identity.registration_id &&
     authorization.registration_added_at === identity.registration_added_at &&
     authorization.root_fingerprint === identity.root_fingerprint
   );
@@ -161,8 +172,7 @@ export async function readAgentPolicy(): Promise<AgentPolicy> {
   return parsePolicy(value);
 }
 
-export async function writeAgentPolicy(value: unknown): Promise<void> {
-  const policy = parsePolicy(value);
+async function persistAgentPolicy(policy: AgentPolicy): Promise<void> {
   const directory = getConfigDirectory();
   const target = getAgentPolicyPath();
   const temporary = path.join(
@@ -203,6 +213,33 @@ export async function writeAgentPolicy(value: unknown): Promise<void> {
       "The agent policy could not be saved; the previous policy was left unchanged.",
     );
   }
+}
+
+/**
+ * Replace a complete policy snapshot. Production read-modify-write mutations
+ * must use mutateAgentPolicy so their read is inside the same lock transaction.
+ */
+export async function writeAgentPolicy(value: unknown): Promise<void> {
+  const policy = parsePolicy(value);
+  await withConfigMutationLock(() => persistAgentPolicy(policy));
+}
+
+interface PolicyMutation<T> {
+  value: T;
+  changed?: boolean;
+}
+
+async function mutateAgentPolicy<T>(
+  mutate: (
+    policy: AgentPolicy,
+  ) => Promise<PolicyMutation<T>> | PolicyMutation<T>,
+): Promise<T> {
+  return withConfigMutationLock(async () => {
+    const policy = await readAgentPolicy();
+    const result = await mutate(policy);
+    if (result.changed !== false) await persistAgentPolicy(policy);
+    return result.value;
+  });
 }
 
 export interface ProjectPolicyStatus {
@@ -283,34 +320,46 @@ export async function enableProjectAuthorization(
   project: ProjectRecord,
   expectedGlobalDefault?: string,
 ): Promise<ProjectAuthorization> {
-  const policy = await readAgentPolicy();
-  if (
-    expectedGlobalDefault !== undefined &&
-    policy.default_profile !== expectedGlobalDefault
-  ) {
-    throw new ContextBridgeError(
-      "agent_policy_changed",
-      "The global default profile changed during confirmation; no authorization was written. Review the policy and try again.",
-    );
-  }
-  const existing = Object.hasOwn(policy.projects, project.id)
-    ? policy.projects[project.id]
-    : undefined;
-  const authorization =
-    existing && authorizationMatchesProject(existing, project)
-      ? {
-          ...existing,
-          enabled: true,
-        }
-      : {
-          ...identityFor(project),
-          enabled: true,
-          allowed_profiles: [policy.default_profile],
-          default_profile: policy.default_profile,
-        };
-  policy.projects[project.id] = authorization;
-  await writeAgentPolicy(policy);
-  return authorization;
+  // Legacy registrations gain their UUID in projects.json first. If the
+  // process crashes before the following policy transaction, authorization
+  // remains stale/off; the policy write rechecks the registration under the
+  // same global lock before enabling it.
+  const identifiedProject = await ensureProjectRegistrationIdentity(project);
+  return mutateAgentPolicy(async (policy) => {
+    const currentProject = await getProject(project.id);
+    if (!sameProjectRegistration(identifiedProject, currentProject)) {
+      throw new ContextBridgeError(
+        "project_registration_changed",
+        "The project registration changed; no authorization was written.",
+      );
+    }
+    if (
+      expectedGlobalDefault !== undefined &&
+      policy.default_profile !== expectedGlobalDefault
+    ) {
+      throw new ContextBridgeError(
+        "agent_policy_changed",
+        "The global default profile changed during confirmation; no authorization was written. Review the policy and try again.",
+      );
+    }
+    const existing = Object.hasOwn(policy.projects, project.id)
+      ? policy.projects[project.id]
+      : undefined;
+    const authorization =
+      existing && authorizationMatchesProject(existing, identifiedProject)
+        ? {
+            ...existing,
+            enabled: true,
+          }
+        : {
+            ...identityFor(identifiedProject),
+            enabled: true,
+            allowed_profiles: [policy.default_profile],
+            default_profile: policy.default_profile,
+          };
+    policy.projects[project.id] = authorization;
+    return { value: authorization };
+  });
 }
 
 export function sameProjectRegistration(
@@ -320,6 +369,7 @@ export function sameProjectRegistration(
   return (
     first.id === second.id &&
     first.addedAt === second.addedAt &&
+    first.registrationId === second.registrationId &&
     identityFor(first).root_fingerprint === identityFor(second).root_fingerprint
   );
 }
@@ -327,16 +377,21 @@ export function sameProjectRegistration(
 export async function disableProjectAuthorization(
   project: ProjectRecord,
 ): Promise<boolean> {
-  const policy = await readAgentPolicy();
-  const existing = Object.hasOwn(policy.projects, project.id)
-    ? policy.projects[project.id]
-    : undefined;
-  if (!existing || !authorizationMatchesProject(existing, project))
-    return false;
-  if (!existing.enabled) return false;
-  policy.projects[project.id] = { ...existing, enabled: false };
-  await writeAgentPolicy(policy);
-  return true;
+  return mutateAgentPolicy(async (policy) => {
+    const registry = await readRegistry();
+    const current = registry.projects.find((entry) => entry.id === project.id);
+    if (!current || !sameProjectRegistration(project, current)) {
+      return { value: false, changed: false };
+    }
+    const existing = Object.hasOwn(policy.projects, project.id)
+      ? policy.projects[project.id]
+      : undefined;
+    if (!existing || !authorizationMatchesProject(existing, current))
+      return { value: false, changed: false };
+    if (!existing.enabled) return { value: false, changed: false };
+    policy.projects[project.id] = { ...existing, enabled: false };
+    return { value: true };
+  });
 }
 
 export async function setProjectAllowedProfiles(
@@ -344,55 +399,62 @@ export async function setProjectAllowedProfiles(
   allowedProfiles: string[],
   requestedDefault?: string,
 ): Promise<ProjectAuthorization> {
-  const policy = await readAgentPolicy();
-  const existing = Object.hasOwn(policy.projects, project.id)
-    ? policy.projects[project.id]
-    : undefined;
-  if (!existing || !authorizationMatchesProject(existing, project)) {
-    throw new ContextBridgeError(
-      "project_policy_stale",
-      "Enable authorization for the current project registration before changing its profiles.",
-    );
-  }
-  if (
-    allowedProfiles.length === 0 ||
-    new Set(allowedProfiles).size !== allowedProfiles.length
-  ) {
-    throw new ContextBridgeError(
-      "invalid_project_policy",
-      "Allow at least one unique profile.",
-    );
-  }
-  for (const profile of allowedProfiles) {
-    if (!Object.hasOwn(policy.profiles, profile)) {
+  return mutateAgentPolicy(async (policy) => {
+    const registry = await readRegistry();
+    const current = registry.projects.find((entry) => entry.id === project.id);
+    const existing = Object.hasOwn(policy.projects, project.id)
+      ? policy.projects[project.id]
+      : undefined;
+    if (
+      !current ||
+      !sameProjectRegistration(project, current) ||
+      !existing ||
+      !authorizationMatchesProject(existing, current)
+    ) {
       throw new ContextBridgeError(
-        "profile_not_found",
-        `No agent profile named "${profile}" exists.`,
+        "project_policy_stale",
+        "Enable authorization for the current project registration before changing its profiles.",
       );
     }
-  }
-  const defaultProfile =
-    requestedDefault ??
-    (existing.default_profile &&
-    allowedProfiles.includes(existing.default_profile)
-      ? existing.default_profile
-      : allowedProfiles.includes(policy.default_profile)
-        ? policy.default_profile
-        : undefined);
-  if (!defaultProfile || !allowedProfiles.includes(defaultProfile)) {
-    throw new ContextBridgeError(
-      "invalid_project_policy",
-      "The project default profile must be included in --allow-profile.",
-    );
-  }
-  const authorization: ProjectAuthorization = {
-    ...existing,
-    allowed_profiles: [...allowedProfiles],
-    default_profile: defaultProfile,
-  };
-  policy.projects[project.id] = authorization;
-  await writeAgentPolicy(policy);
-  return authorization;
+    if (
+      allowedProfiles.length === 0 ||
+      new Set(allowedProfiles).size !== allowedProfiles.length
+    ) {
+      throw new ContextBridgeError(
+        "invalid_project_policy",
+        "Allow at least one unique profile.",
+      );
+    }
+    for (const profile of allowedProfiles) {
+      if (!Object.hasOwn(policy.profiles, profile)) {
+        throw new ContextBridgeError(
+          "profile_not_found",
+          `No agent profile named "${profile}" exists.`,
+        );
+      }
+    }
+    const defaultProfile =
+      requestedDefault ??
+      (existing.default_profile &&
+      allowedProfiles.includes(existing.default_profile)
+        ? existing.default_profile
+        : allowedProfiles.includes(policy.default_profile)
+          ? policy.default_profile
+          : undefined);
+    if (!defaultProfile || !allowedProfiles.includes(defaultProfile)) {
+      throw new ContextBridgeError(
+        "invalid_project_policy",
+        "The project default profile must be included in --allow-profile.",
+      );
+    }
+    const authorization: ProjectAuthorization = {
+      ...existing,
+      allowed_profiles: [...allowedProfiles],
+      default_profile: defaultProfile,
+    };
+    policy.projects[project.id] = authorization;
+    return { value: authorization };
+  });
 }
 
 export async function addAgentProfile(
@@ -407,66 +469,69 @@ export async function addAgentProfile(
       "The profile name, model ID, or reasoning effort has an invalid format.",
     );
   }
-  const policy = await readAgentPolicy();
-  if (Object.hasOwn(policy.profiles, name)) {
-    throw new ContextBridgeError(
-      "profile_exists",
-      `Agent profile "${name}" already exists.`,
-    );
-  }
-  policy.profiles[name] = profileResult.data;
-  await writeAgentPolicy(policy);
+  await mutateAgentPolicy((policy) => {
+    if (Object.hasOwn(policy.profiles, name)) {
+      throw new ContextBridgeError(
+        "profile_exists",
+        `Agent profile "${name}" already exists.`,
+      );
+    }
+    policy.profiles[name] = profileResult.data;
+    return { value: undefined };
+  });
 }
 
 export async function setGlobalDefaultProfile(name: string): Promise<void> {
-  const policy = await readAgentPolicy();
-  if (!Object.hasOwn(policy.profiles, name)) {
-    throw new ContextBridgeError(
-      "profile_not_found",
-      `No agent profile named "${name}" exists.`,
-    );
-  }
-  for (const authorization of Object.values(policy.projects)) {
-    if (
-      authorization.default_profile === undefined &&
-      !authorization.allowed_profiles.includes(name)
-    ) {
+  await mutateAgentPolicy((policy) => {
+    if (!Object.hasOwn(policy.profiles, name)) {
       throw new ContextBridgeError(
-        "invalid_project_policy",
-        "The new global default is not allowed by a project without its own default; set that project's default first.",
+        "profile_not_found",
+        `No agent profile named "${name}" exists.`,
       );
     }
-  }
-  policy.default_profile = name;
-  await writeAgentPolicy(policy);
+    for (const authorization of Object.values(policy.projects)) {
+      if (
+        authorization.default_profile === undefined &&
+        !authorization.allowed_profiles.includes(name)
+      ) {
+        throw new ContextBridgeError(
+          "invalid_project_policy",
+          "The new global default is not allowed by a project without its own default; set that project's default first.",
+        );
+      }
+    }
+    policy.default_profile = name;
+    return { value: undefined };
+  });
 }
 
 export async function removeAgentProfile(name: string): Promise<void> {
-  const policy = await readAgentPolicy();
-  if (!Object.hasOwn(policy.profiles, name)) {
-    throw new ContextBridgeError(
-      "profile_not_found",
-      `No agent profile named "${name}" exists.`,
-    );
-  }
-  if (policy.default_profile === name) {
-    throw new ContextBridgeError(
-      "profile_in_use",
-      `Agent profile "${name}" is the global default and cannot be removed.`,
-    );
-  }
-  if (
-    Object.values(policy.projects).some(
-      (authorization) =>
-        authorization.allowed_profiles.includes(name) ||
-        authorization.default_profile === name,
-    )
-  ) {
-    throw new ContextBridgeError(
-      "profile_in_use",
-      `Agent profile "${name}" is referenced by a project policy and cannot be removed.`,
-    );
-  }
-  delete policy.profiles[name];
-  await writeAgentPolicy(policy);
+  await mutateAgentPolicy((policy) => {
+    if (!Object.hasOwn(policy.profiles, name)) {
+      throw new ContextBridgeError(
+        "profile_not_found",
+        `No agent profile named "${name}" exists.`,
+      );
+    }
+    if (policy.default_profile === name) {
+      throw new ContextBridgeError(
+        "profile_in_use",
+        `Agent profile "${name}" is the global default and cannot be removed.`,
+      );
+    }
+    if (
+      Object.values(policy.projects).some(
+        (authorization) =>
+          authorization.allowed_profiles.includes(name) ||
+          authorization.default_profile === name,
+      )
+    ) {
+      throw new ContextBridgeError(
+        "profile_in_use",
+        `Agent profile "${name}" is referenced by a project policy and cannot be removed.`,
+      );
+    }
+    delete policy.profiles[name];
+    return { value: undefined };
+  });
 }
