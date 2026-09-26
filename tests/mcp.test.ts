@@ -165,6 +165,28 @@ describe.sequential("MCP contract", () => {
       expect(hostile.status).toBe(403);
 
       await client.connect(transport);
+      const tools = await client.listTools();
+      expect(tools.tools.map((tool) => tool.name).sort()).toEqual([
+        "file_read",
+        "files_list",
+        "files_search",
+        "git_diff",
+        "git_log",
+        "git_show",
+        "git_status",
+        "project_get",
+        "projects_list",
+      ]);
+      await expect(
+        client.callTool({
+          name: "task_start",
+          arguments: {
+            project_id: "registered-project",
+            prompt: "This must not execute over HTTP.",
+          },
+        }),
+      ).rejects.toThrow("Tool task_start not found");
+
       const projects = await client.callTool({
         name: "projects_list",
         arguments: {},

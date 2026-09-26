@@ -817,21 +817,40 @@ export class TaskManager {
   }
 
   async getTaskView(taskId: string): Promise<TaskView> {
+    const { record, project } = await this.readRegisteredTask(taskId);
+    return toTaskView(record, project);
+  }
+
+  /** Return the durable record only while its project registration still matches. */
+  async getTaskRecordForCurrentRegistration(
+    taskId: string,
+  ): Promise<TaskRecord> {
+    return (await this.readRegisteredTask(taskId)).record;
+  }
+
+  private async readRegisteredTask(taskId: string): Promise<{
+    record: TaskRecord;
+    project: ProjectRecord;
+  }> {
+    this.assertOwner();
     taskId = normalizeTaskId(taskId);
-    const record = await this.getTask(taskId);
+    const record = await this.store.read(taskId);
     const registry = await readRegistry().catch(() => {
       throw new TaskError("task_registration_stale");
     });
     const project = registry.projects.find(
       (entry) => entry.id === record.project_id,
     );
-    return toTaskView(record, project);
+    if (!registrationMatchesTask(record, project)) {
+      throw new TaskError("task_registration_stale");
+    }
+    return { record, project };
   }
 
-  async listTaskViews(options: {
+  async listRegisteredTaskRecordsPage(options: {
     project_id?: string;
     limit: number;
-  }): Promise<TaskListItem[]> {
+  }): Promise<{ records: TaskRecord[]; truncated: boolean }> {
     this.assertOwner();
     if (
       !Number.isInteger(options.limit) ||
@@ -846,8 +865,7 @@ export class TaskManager {
     const projects = new Map(
       registry.projects.map((project) => [project.id, project]),
     );
-    const records = await this.store.list();
-    return records
+    const eligible = (await this.store.list())
       .filter((record) => {
         if (options.project_id && record.project_id !== options.project_id) {
           return false;
@@ -858,9 +876,19 @@ export class TaskManager {
         (left, right) =>
           right.updated_at.localeCompare(left.updated_at) ||
           left.task_id.localeCompare(right.task_id),
-      )
-      .slice(0, options.limit)
-      .map(toTaskListItem);
+      );
+    return {
+      records: eligible.slice(0, options.limit),
+      truncated: eligible.length > options.limit,
+    };
+  }
+
+  async listTaskViews(options: {
+    project_id?: string;
+    limit: number;
+  }): Promise<TaskListItem[]> {
+    const page = await this.listRegisteredTaskRecordsPage(options);
+    return page.records.map(toTaskListItem);
   }
 
   async waitForTask(

@@ -15,6 +15,9 @@ import {
   getGitShow,
   getGitStatus,
 } from "../git/service.js";
+import { jsonResult } from "./results.js";
+import { registerTaskTools } from "./task-tools.js";
+import type { TaskToolHost } from "./task-host.js";
 
 const PROJECT_ID = z
   .string()
@@ -26,27 +29,6 @@ const READ_ONLY = {
   destructiveHint: false,
   openWorldHint: false,
 } as const;
-// The MCP payload carries both JSON text content and structuredContent, so
-// its encoded envelope can be larger than the 1 MiB source-data limits.
-const MAX_MCP_ENVELOPE_BYTES = 16 * 1024 * 1024;
-
-function jsonResult(value: unknown) {
-  const serialized = JSON.stringify(value);
-  const result = {
-    content: [{ type: "text" as const, text: serialized }],
-    structuredContent: value as Record<string, unknown>,
-  };
-  if (
-    Buffer.byteLength(JSON.stringify(result), "utf8") > MAX_MCP_ENVELOPE_BYTES
-  ) {
-    throw new ContextBridgeError(
-      "output_limit",
-      "The result exceeded the 16 MiB encoded MCP response limit.",
-    );
-  }
-  return result;
-}
-
 function toolError(error: unknown) {
   const code =
     error instanceof ContextBridgeError ? error.code : "internal_error";
@@ -102,15 +84,18 @@ async function projectCapabilities(project: ProjectRecord) {
   };
 }
 
-export function createContextBridgeServer(): McpServer {
+export function createContextBridgeServer(
+  options: { taskHost?: TaskToolHost } = {},
+): McpServer {
   const server = new McpServer(
     {
       name: "Context Bridge",
       version: "0.1.0",
     },
     {
-      instructions:
-        "Use this server only to inspect explicitly registered local projects. Discover a project with projects_list or project_get, then inspect Git status before assuming repository state. Search narrowly before reading large files, retrieve only relevant paths, and use git_diff when reviewing recent implementation work. Do not claim to have inspected code that was not returned by a tool. All tools are read-only.",
+      instructions: options.taskHost
+        ? "Use the file and Git tools only to inspect explicitly registered local projects; those tools are read-only. task_start can cause Codex to read and write a project only after local agent authorization is enabled. A task_start result means the turn was accepted, not completed; use task_get to poll or wait. task_cancel requests cancellation and may leave partial edits. Inspect actual changes with git_status and git_diff; baseline counts do not prove a file changed. Codex receives no network access, and only locally agent-enabled projects can execute. Discover projects with projects_list or project_get, search narrowly, and never claim to have inspected content that tools did not return."
+        : "Use this server only to inspect explicitly registered local projects. Discover a project with projects_list or project_get, then inspect Git status before assuming repository state. Search narrowly before reading large files, retrieve only relevant paths, and use git_diff when reviewing recent implementation work. Do not claim to have inspected code that was not returned by a tool. All tools are read-only.",
     },
   );
 
@@ -401,6 +386,8 @@ export function createContextBridgeServer(): McpServer {
         };
       }),
   );
+
+  if (options.taskHost) registerTaskTools(server, options.taskHost);
 
   return server;
 }

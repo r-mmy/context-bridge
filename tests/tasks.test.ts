@@ -770,6 +770,28 @@ describe.sequential("task persistence and manager", () => {
     ).toHaveLength(1);
   });
 
+  it("reports whether a registration-filtered task page has another item", async () => {
+    const harness = await createHarness();
+    const first = await createTask(harness);
+    await new Promise<void>((resolve) => setTimeout(resolve, 5));
+    const second = await createTask(harness);
+
+    const page = await harness.runtime.manager.listRegisteredTaskRecordsPage({
+      project_id: harness.project.id,
+      limit: 1,
+    });
+    expect(page.records).toHaveLength(1);
+    expect(page.records[0]?.task_id).toBe(second.allocation.task_id);
+    expect(page.truncated).toBe(true);
+    expect(first.allocation.task_id).not.toBe(second.allocation.task_id);
+    expect(
+      await harness.runtime.manager.listRegisteredTaskRecordsPage({
+        project_id: "another-project",
+        limit: 1,
+      }),
+    ).toEqual({ records: [], truncated: false });
+  });
+
   it("hides historical task views after project removal or registration replacement", async () => {
     const harness = await createHarness();
     const { allocation } = await createTask(harness);
@@ -782,9 +804,19 @@ describe.sequential("task persistence and manager", () => {
     await expect(
       harness.runtime.manager.getTaskView(allocation.task_id),
     ).rejects.toMatchObject({ code: "task_registration_stale" });
+    await expect(
+      harness.runtime.manager.getTaskRecordForCurrentRegistration(
+        allocation.task_id,
+      ),
+    ).rejects.toMatchObject({ code: "task_registration_stale" });
     expect(await harness.runtime.manager.listTaskViews({ limit: 10 })).toEqual(
       [],
     );
+    expect(
+      await harness.runtime.manager.listRegisteredTaskRecordsPage({
+        limit: 10,
+      }),
+    ).toEqual({ records: [], truncated: false });
 
     const registry = await readRegistry();
     registry.projects.push({

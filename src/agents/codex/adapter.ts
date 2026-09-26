@@ -1,5 +1,4 @@
 import type {
-  AgentAdapter,
   AgentBackendInfo,
   AgentExecutionAdapter,
   AgentExecutionEvent,
@@ -366,7 +365,7 @@ function boundedIdentifier(value: unknown): string | undefined {
 
 let sharedCodexAdapter: CodexAgentAdapter | undefined;
 
-export function getCodexAgentAdapter(): AgentAdapter {
+export function getCodexAgentAdapter(): AgentExecutionAdapter {
   sharedCodexAdapter ??= new CodexAgentAdapter();
   return sharedCodexAdapter;
 }
