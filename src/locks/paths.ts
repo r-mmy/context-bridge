@@ -10,6 +10,10 @@ export function getConfigMutationLockPath(): string {
   return path.join(getAgentLockDirectory(), "config-mutation.lock");
 }
 
+export function getTaskRuntimeLockPath(): string {
+  return path.join(getAgentLockDirectory(), "task-runtime.lock");
+}
+
 export function getProjectWriterLockPath(canonicalRoot: string): string {
   const normalizedRoot = path.resolve(canonicalRoot);
   const identity =

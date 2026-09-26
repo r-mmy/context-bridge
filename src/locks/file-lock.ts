@@ -8,6 +8,7 @@ import {
   getAgentLockDirectory,
   getConfigMutationLockPath,
   getProjectWriterLockPath,
+  getTaskRuntimeLockPath,
 } from "./paths.js";
 
 export interface FileLockHandle {
@@ -274,6 +275,12 @@ export async function tryAcquireProjectWriterLock(
 ): Promise<FileLockHandle | undefined> {
   const lock = await tryAcquire(getProjectWriterLockPath(canonicalRoot));
   return lock;
+}
+
+export async function tryAcquireTaskRuntimeLock(): Promise<
+  FileLockHandle | undefined
+> {
+  return tryAcquire(getTaskRuntimeLockPath());
 }
 
 export async function acquireProjectWriterLock(

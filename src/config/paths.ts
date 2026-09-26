@@ -33,3 +33,23 @@ export function getAgentPolicyPath(
 ): string {
   return path.join(getConfigDirectory(env), "agent-policy.json");
 }
+
+export function getTasksDirectory(
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  return path.join(getConfigDirectory(env), "tasks");
+}
+
+export function getTaskPath(
+  taskId: string,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  if (
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+      taskId,
+    )
+  ) {
+    throw new TypeError("A valid task UUID is required.");
+  }
+  return path.join(getTasksDirectory(env), `${taskId.toLowerCase()}.json`);
+}
