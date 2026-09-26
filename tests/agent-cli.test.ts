@@ -1,4 +1,4 @@
-import { access, mkdir, mkdtemp, rm } from "node:fs/promises";
+import { access, mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -370,8 +370,9 @@ describe.sequential("agent M1 CLI", () => {
     const stored = (await readAgentPolicy()).projects[id];
     expect(stored).toBeDefined();
 
-    const replacementRoot = path.join(root, "replacement-root");
-    await mkdir(replacementRoot, { recursive: true });
+    const replacementPath = path.join(root, "replacement-root");
+    await mkdir(replacementPath, { recursive: true });
+    const replacementRoot = await realpath(replacementPath);
     git(replacementRoot, ["init", "--quiet"]);
     const registry = await readRegistry();
     const project = registry.projects.find((entry) => entry.id === id);
