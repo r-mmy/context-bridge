@@ -1,4 +1,4 @@
-import { constants } from "node:fs";
+import { constants, type Stats } from "node:fs";
 import {
   chmod,
   link,
@@ -32,10 +32,12 @@ const TASK_FILENAME =
   /^([0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.json$/;
 const WINDOWS_RENAME_RETRY_DELAYS_MS = [10, 25, 50, 100, 200] as const;
 const WINDOWS_RENAME_RETRYABLE_CODES = new Set(["EPERM", "EACCES", "EBUSY"]);
+const READ_IDENTITY_RETRY_DELAYS_MS = [1, 2, 4, 8] as const;
 
 interface TaskStoreOptions {
   platform?: NodeJS.Platform;
   renameFile?: (source: string, destination: string) => Promise<void>;
+  lstatFile?: (filePath: string) => Promise<Stats>;
 }
 
 function codeIs(error: unknown, code: string): boolean {
@@ -94,10 +96,12 @@ export class TaskStore {
     source: string,
     destination: string,
   ) => Promise<void>;
+  private readonly lstatFile: (filePath: string) => Promise<Stats>;
 
   constructor(options: TaskStoreOptions = {}) {
     this.platform = options.platform ?? process.platform;
     this.renameFile = options.renameFile ?? rename;
+    this.lstatFile = options.lstatFile ?? lstat;
   }
 
   async initialize(): Promise<void> {
@@ -268,36 +272,51 @@ export class TaskStore {
     const filePath = getTaskPath(taskId);
     const noFollow =
       process.platform === "win32" ? 0 : (constants.O_NOFOLLOW ?? 0);
-    const handle = await open(filePath, constants.O_RDONLY | noFollow);
-    try {
-      const [opened, entry] = await Promise.all([
-        handle.stat(),
-        lstat(filePath),
-      ]);
-      if (!sameFile(opened, entry) || opened.size > MAX_TASK_FILE_BYTES) {
-        throw new TaskError(
-          opened.size > MAX_TASK_FILE_BYTES
-            ? "task_store_capacity"
-            : "task_store_error",
-        );
-      }
-      const bytes = await handle.readFile();
-      if (bytes.byteLength > MAX_TASK_FILE_BYTES) {
-        throw new TaskError("task_store_capacity");
-      }
-      let parsedJson: unknown;
+    for (let attempt = 0; ; attempt += 1) {
+      const handle = await open(filePath, constants.O_RDONLY | noFollow);
+      let retryDelayMs: number | undefined;
       try {
-        parsedJson = JSON.parse(
-          new TextDecoder("utf-8", { fatal: true }).decode(bytes),
-        );
-      } catch {
-        throw new TaskError("task_store_error");
+        const opened = await handle.stat();
+        const entry = await this.lstatFile(filePath);
+        if (opened.size > MAX_TASK_FILE_BYTES) {
+          throw new TaskError("task_store_capacity");
+        }
+        if (!sameFile(opened, entry)) {
+          const delayMs = READ_IDENTITY_RETRY_DELAYS_MS[attempt];
+          if (
+            delayMs !== undefined &&
+            opened.isFile() &&
+            entry.isFile() &&
+            !entry.isSymbolicLink()
+          ) {
+            retryDelayMs = delayMs;
+          } else {
+            throw new TaskError("task_store_error");
+          }
+        } else {
+          const bytes = await handle.readFile();
+          if (bytes.byteLength > MAX_TASK_FILE_BYTES) {
+            throw new TaskError("task_store_capacity");
+          }
+          let parsedJson: unknown;
+          try {
+            parsedJson = JSON.parse(
+              new TextDecoder("utf-8", { fatal: true }).decode(bytes),
+            );
+          } catch {
+            throw new TaskError("task_store_error");
+          }
+          const record = validateRecord(parsedJson);
+          if (record.task_id !== taskId)
+            throw new TaskError("task_store_error");
+          return { record, byteLength: bytes.byteLength };
+        }
+      } finally {
+        await handle.close().catch(() => undefined);
       }
-      const record = validateRecord(parsedJson);
-      if (record.task_id !== taskId) throw new TaskError("task_store_error");
-      return { record, byteLength: bytes.byteLength };
-    } finally {
-      await handle.close().catch(() => undefined);
+      if (retryDelayMs !== undefined) {
+        await new Promise<void>((resolve) => setTimeout(resolve, retryDelayMs));
+      }
     }
   }
 }

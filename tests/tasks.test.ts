@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
   mkdtemp,
+  lstat,
   mkdir,
   readFile,
   readdir,
@@ -8,6 +9,7 @@ import {
   rm,
   writeFile,
 } from "node:fs/promises";
+import type { Stats } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -196,6 +198,35 @@ describe.sequential("task persistence and manager", () => {
     expect(
       (await harness.store.read(record.task_id)).detected_codex_version,
     ).toBe("1.2.3");
+  });
+
+  it("retries reads after a transient path identity change during atomic replacement", async () => {
+    // The first path lookup sees a replacement regular file while the open
+    // descriptor still refers to the previous inode.
+    const replacementObservation = {
+      dev: -1,
+      ino: -1,
+      isFile: () => true,
+      isSymbolicLink: () => false,
+    } as unknown as Stats;
+    let reportReplacementOnce = false;
+    const store = new TaskStore({
+      lstatFile: async (filePath) => {
+        if (reportReplacementOnce) {
+          reportReplacementOnce = false;
+          return replacementObservation;
+        }
+        return lstat(filePath);
+      },
+    });
+    const harness = await createHarness(store);
+    const { allocation } = await createTask(harness);
+
+    reportReplacementOnce = true;
+    await expect(store.read(allocation.task_id)).resolves.toMatchObject({
+      task_id: allocation.task_id,
+      detected_codex_version: null,
+    });
   });
 
   it("retries bounded transient Windows denials during atomic task replacement", async () => {
