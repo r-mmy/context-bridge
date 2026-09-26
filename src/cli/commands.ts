@@ -5,6 +5,16 @@ import { constants } from "node:fs";
 import path from "node:path";
 import { getAgentPolicyPath, getRegistryPath } from "../config/paths.js";
 import {
+  validateProfileCapabilities,
+  type AgentAdapter,
+  type AgentBackendInfo,
+  type AgentModel,
+} from "../agents/adapter.js";
+import {
+  AgentAdapterError,
+  type AgentAdapterErrorCode,
+} from "../agents/errors.js";
+import {
   addAgentProfile,
   disableProjectAuthorization,
   enableProjectAuthorization,
@@ -30,6 +40,7 @@ import {
 } from "../projects/registry.js";
 import { ContextBridgeError } from "../security/errors.js";
 import { isGitRepository } from "../git/run.js";
+import { getCodexAgentAdapter } from "../agents/codex/adapter.js";
 import { startHttpServer } from "../transports/http.js";
 import { startStdioServer } from "../transports/stdio.js";
 
@@ -64,6 +75,11 @@ export interface CliIO {
   stderr: (text: string) => void;
   cwd: string;
   confirm?: (prompt: string) => Promise<boolean>;
+}
+
+export interface CliDependencies {
+  /** Internal seam for deterministic doctor tests; not user- or MCP-configurable. */
+  createAgentAdapter?: () => AgentAdapter;
 }
 
 function defaultIO(): CliIO {
@@ -329,7 +345,11 @@ async function commandProject(args: string[], io: CliIO): Promise<void> {
   throw new ContextBridgeError("usage", `Unknown project command "${action}".`);
 }
 
-async function commandAgent(args: string[], io: CliIO): Promise<void> {
+async function commandAgent(
+  args: string[],
+  io: CliIO,
+  createAgentAdapter: () => AgentAdapter,
+): Promise<void> {
   const [area, action, ...rest] = args;
   if (area === "enable" || area === "disable" || area === "status") {
     if (!action || rest.length !== 0) {
@@ -440,13 +460,28 @@ async function commandAgent(args: string[], io: CliIO): Promise<void> {
         );
       }
       io.stdout(
-        "Model/effort support is not checked until the App Server milestone.\n",
+        "Profile additions validate model and effort against the local Codex App Server. Doctor checks configured profiles when agent execution is enabled.\n",
       );
       return;
     }
     if (action === "add") {
       const { name, profile } = parseProfileAdd(rest);
-      await addAgentProfile(name, profile);
+      const currentPolicy = await readAgentPolicy();
+      if (Object.hasOwn(currentPolicy.profiles, name)) {
+        throw new ContextBridgeError(
+          "profile_exists",
+          `Agent profile "${name}" already exists.`,
+        );
+      }
+      const adapter = createAgentAdapter();
+      try {
+        await adapter.start();
+        await adapter.requireAuthentication();
+        await adapter.validateProfile(profile);
+        await addAgentProfile(name, profile);
+      } finally {
+        await adapter.close().catch(() => undefined);
+      }
       io.stdout(`Added agent profile ${name}.\n`);
       return;
     }
@@ -527,7 +562,10 @@ async function commandAgent(args: string[], io: CliIO): Promise<void> {
   );
 }
 
-async function commandDoctor(io: CliIO): Promise<void> {
+async function commandDoctor(
+  io: CliIO,
+  createAgentAdapter: () => AgentAdapter,
+): Promise<void> {
   let registryExists = true;
   try {
     await access(getRegistryPath(), constants.F_OK);
@@ -541,7 +579,7 @@ async function commandDoctor(io: CliIO): Promise<void> {
   io.stdout(`Git: ${hasGit ? "available" : "not found on PATH"}\n`);
   io.stdout(`Registry: ${registryExists ? "available" : "not initialized"}\n`);
   if (!registryExists) {
-    await commandAgentDoctor(io);
+    await commandAgentDoctor(io, createAgentAdapter);
     return;
   }
   const registry = await readRegistry();
@@ -561,10 +599,17 @@ async function commandDoctor(io: CliIO): Promise<void> {
       }
     }
   }
-  await commandAgentDoctor(io);
+  await commandAgentDoctor(io, createAgentAdapter);
 }
 
-async function commandAgentDoctor(io: CliIO): Promise<void> {
+function agentErrorCode(error: unknown): AgentAdapterErrorCode | undefined {
+  return error instanceof AgentAdapterError ? error.code : undefined;
+}
+
+async function commandAgentDoctor(
+  io: CliIO,
+  createAgentAdapter: () => AgentAdapter,
+): Promise<void> {
   let policyFileExists = true;
   try {
     await access(getAgentPolicyPath(), constants.F_OK);
@@ -581,6 +626,9 @@ async function commandAgentDoctor(io: CliIO): Promise<void> {
       error.code === "agent_policy_invalid"
     ) {
       io.stdout("Agent policy: invalid; agent authorization fails closed\n");
+      io.stdout(
+        "Codex App Server: not checked (agent authorization state unavailable)\n",
+      );
       return;
     }
     if (
@@ -589,6 +637,9 @@ async function commandAgentDoctor(io: CliIO): Promise<void> {
     ) {
       io.stdout(
         "Agent policy: unavailable; agent authorization fails closed\n",
+      );
+      io.stdout(
+        "Codex App Server: not checked (agent authorization state unavailable)\n",
       );
       return;
     }
@@ -606,15 +657,114 @@ async function commandAgentDoctor(io: CliIO): Promise<void> {
   let enabled = 0;
   let disabled = 0;
   let stale = 0;
+  const enabledPolicies: ProjectPolicyStatus[] = [];
   for (const projectId of Object.keys(policy.projects)) {
     const status = await getProjectPolicyStatus(projectId);
     if (status.registration_state !== "matching") stale += 1;
-    else if (status.enabled) enabled += 1;
-    else disabled += 1;
+    else if (status.enabled) {
+      enabled += 1;
+      enabledPolicies.push(status);
+    } else disabled += 1;
   }
   io.stdout(
     `Agent authorization: ${enabled} enabled; ${disabled} disabled; ${stale} stale or mismatched\n`,
   );
+
+  if (enabledPolicies.length === 0) {
+    io.stdout("Codex App Server: not checked (agent execution not enabled)\n");
+    return;
+  }
+
+  const adapter = createAgentAdapter();
+  let backend: AgentBackendInfo;
+  try {
+    try {
+      backend = await adapter.start();
+    } catch (error) {
+      const code = agentErrorCode(error);
+      if (code === "codex_not_found") {
+        io.stdout("Codex executable: missing\n");
+        io.stdout("App Server handshake: not available\n");
+      } else {
+        const executableStatus =
+          code === "app_server_start_failed" ? "could not start" : "found";
+        io.stdout(`Codex executable: ${executableStatus}\n`);
+        io.stdout(
+          `App Server handshake: ${
+            code === "app_server_incompatible" ||
+            code === "app_server_protocol_error"
+              ? "incompatible"
+              : "unavailable"
+          }\n`,
+        );
+      }
+      io.stdout("Local Codex authentication: not checked\n");
+      io.stdout("Codex model discovery: not checked\n");
+      io.stdout("Agent default profile: unavailable\n");
+      io.stdout("Enabled project profiles: unavailable\n");
+      return;
+    }
+
+    io.stdout("Codex executable: found\n");
+    io.stdout("App Server handshake: compatible\n");
+    io.stdout(
+      `Codex version: ${backend.version ?? "not reported by App Server"}\n`,
+    );
+
+    try {
+      const authenticated = await adapter.checkAuthentication();
+      io.stdout(
+        `Local Codex authentication: ${authenticated ? "available" : "unavailable"}\n`,
+      );
+    } catch {
+      io.stdout("Local Codex authentication: unavailable (check failed)\n");
+    }
+
+    let models: AgentModel[];
+    try {
+      models = await adapter.listModels();
+      io.stdout("Codex model discovery: available\n");
+    } catch {
+      io.stdout("Codex model discovery: unavailable\n");
+      io.stdout("Agent default profile: unavailable\n");
+      io.stdout("Enabled project profiles: unavailable\n");
+      return;
+    }
+
+    const defaultProfile: AgentProfile | undefined =
+      policy.profiles[policy.default_profile];
+    let defaultValid = false;
+    try {
+      if (!defaultProfile) throw new AgentAdapterError("model_unavailable");
+      validateProfileCapabilities(defaultProfile, models);
+      defaultValid = true;
+    } catch {
+      defaultValid = false;
+    }
+    io.stdout(
+      `Agent default profile ${policy.default_profile}: ${defaultValid ? "valid" : "invalid"}\n`,
+    );
+
+    let validProjectProfiles = 0;
+    let invalidProjectProfiles = 0;
+    for (const status of enabledPolicies) {
+      for (const profileName of status.authorization?.allowed_profiles ?? []) {
+        const profile = policy.profiles[profileName];
+        try {
+          if (!profile) throw new AgentAdapterError("model_unavailable");
+          validateProfileCapabilities(profile, models);
+          validProjectProfiles += 1;
+        } catch {
+          invalidProjectProfiles += 1;
+        }
+      }
+    }
+    io.stdout(
+      `Enabled project profiles: ${validProjectProfiles} valid; ${invalidProjectProfiles} invalid\n`,
+    );
+  } finally {
+    await adapter.close().catch(() => undefined);
+  }
 }
 
 async function commandMcp(args: string[]): Promise<void> {
@@ -665,6 +815,7 @@ async function commandMcp(args: string[]): Promise<void> {
 export async function runCli(
   argv: string[],
   io: CliIO = defaultIO(),
+  dependencies: CliDependencies = {},
 ): Promise<number> {
   const args = [...argv];
   try {
@@ -688,13 +839,20 @@ export async function runCli(
       return 0;
     }
     if (first === "agent") {
-      await commandAgent(args.slice(1), io);
+      await commandAgent(
+        args.slice(1),
+        io,
+        dependencies.createAgentAdapter ?? getCodexAgentAdapter,
+      );
       return 0;
     }
     if (first === "doctor") {
       if (args.length > 1)
         throw new ContextBridgeError("usage", "doctor takes no arguments.");
-      await commandDoctor(io);
+      await commandDoctor(
+        io,
+        dependencies.createAgentAdapter ?? getCodexAgentAdapter,
+      );
       return 0;
     }
     if (first === "mcp") {

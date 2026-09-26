@@ -4,6 +4,8 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { getAgentPolicyPath } from "../src/config/paths.js";
 import { readAgentPolicy } from "../src/agents/policy.js";
+import type { AgentAdapter } from "../src/agents/adapter.js";
+import { AgentAdapterError } from "../src/agents/errors.js";
 import { runCli, type CliIO } from "../src/cli/commands.js";
 import { readRegistry, writeRegistry } from "../src/projects/registry.js";
 import { git } from "./helpers.js";
@@ -88,7 +90,7 @@ describe.sequential("agent M1 CLI", () => {
       "luna-max\tgpt-6-luna\tmax (default)",
     );
     expect(list.output.join("")).toContain(
-      "Model/effort support is not checked",
+      "Profile additions validate model and effort",
     );
     expect(await runCli(["agent", "status", id], status)).toBe(0);
     expect(status.output.join("")).toContain("Authorization: disabled");
@@ -170,6 +172,33 @@ describe.sequential("agent M1 CLI", () => {
     await enableProject(id, root);
 
     const add = testIO(root);
+    const adapterCalls: string[] = [];
+    const adapter: AgentAdapter = {
+      async start() {
+        adapterCalls.push("start");
+        return {
+          provider: "codex",
+          connected: true,
+          experimentalApi: true,
+          version: "0.155.0-alpha.16.3",
+        };
+      },
+      async checkAuthentication() {
+        return true;
+      },
+      async requireAuthentication() {
+        adapterCalls.push("authentication");
+      },
+      async listModels() {
+        return [];
+      },
+      async validateProfile(profile) {
+        adapterCalls.push(`${profile.model_id}/${profile.reasoning_effort}`);
+      },
+      async close() {
+        adapterCalls.push("close");
+      },
+    };
     expect(
       await runCli(
         [
@@ -183,8 +212,42 @@ describe.sequential("agent M1 CLI", () => {
           "high",
         ],
         add,
+        { createAgentAdapter: () => adapter },
       ),
     ).toBe(0);
+    expect(adapterCalls).toEqual([
+      "start",
+      "authentication",
+      "gpt-6-sol/high",
+      "close",
+    ]);
+    const unsupportedAdapter: AgentAdapter = {
+      ...adapter,
+      async validateProfile() {
+        throw new AgentAdapterError("effort_unsupported");
+      },
+    };
+    const unsupported = testIO(root);
+    expect(
+      await runCli(
+        [
+          "agent",
+          "profile",
+          "add",
+          "sol-max",
+          "--model",
+          "gpt-6-sol",
+          "--effort",
+          "max",
+        ],
+        unsupported,
+        { createAgentAdapter: () => unsupportedAdapter },
+      ),
+    ).toBe(1);
+    expect(unsupported.errors.join("")).toContain(
+      "not supported by the selected local Codex model",
+    );
+    expect((await readAgentPolicy()).profiles["sol-max"]).toBeUndefined();
     expect(await runCli(["agent", "profile", "default", "sol-high"], add)).toBe(
       0,
     );
