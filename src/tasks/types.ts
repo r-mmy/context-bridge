@@ -78,6 +78,21 @@ const NullablePositiveCountSchema = z
   .positive()
   .max(Number.MAX_SAFE_INTEGER)
   .nullable();
+export const GitBaselineSchema = z
+  .object({
+    branch: boundedText(256).nullable(),
+    head: z
+      .string()
+      .regex(/^[0-9a-f]{40,64}$/i)
+      .nullable(),
+    staged: CountSchema,
+    modified: CountSchema,
+    deleted: CountSchema,
+    untracked: CountSchema,
+    truncated: z.boolean(),
+  })
+  .strict();
+export type GitBaseline = z.infer<typeof GitBaselineSchema>;
 function isSafeDisplayName(value: string): boolean {
   if (value.length === 0 || value.includes("/") || value.includes("\\")) {
     return false;
@@ -213,7 +228,7 @@ export const TurnRecordSchema = z
     completed_at: NullableTimestampSchema,
     prompt_preview: boundedText(MAX_PROMPT_PREVIEW_BYTES),
     prompt_sha256: z.string().regex(HASH_PATTERN),
-    git_baseline: z.null(),
+    git_baseline: GitBaselineSchema.nullable(),
     input_wait_ms: CountSchema,
     input_wait_count: CountSchema,
     final_response: FinalResponseSchema.nullable(),

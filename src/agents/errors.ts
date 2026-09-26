@@ -27,11 +27,16 @@ const SAFE_MESSAGES: Record<AgentAdapterErrorCode, string> = {
 
 export class AgentAdapterError extends Error {
   readonly code: AgentAdapterErrorCode;
+  readonly requestRejected: boolean;
 
-  constructor(code: AgentAdapterErrorCode) {
+  constructor(
+    code: AgentAdapterErrorCode,
+    options: { requestRejected?: boolean } = {},
+  ) {
     super(SAFE_MESSAGES[code]);
     this.name = "AgentAdapterError";
     this.code = code;
+    this.requestRejected = options.requestRejected ?? false;
   }
 }
 

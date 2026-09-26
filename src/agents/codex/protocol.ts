@@ -19,11 +19,18 @@ export interface JsonRpcNotification {
   params: unknown;
 }
 
+export interface JsonRpcServerRequest {
+  id: RpcId;
+  method: string;
+  params: unknown;
+}
+
 export interface JsonRpcConnectionOptions {
   requestTimeoutMs?: number;
   maxLineBytes?: number;
   maxPendingRequests?: number;
   onNotification?: (notification: JsonRpcNotification) => void;
+  onServerRequest?: (request: JsonRpcServerRequest) => void;
   onFailure?: (error: AgentAdapterError) => void;
 }
 
@@ -45,6 +52,8 @@ export class JsonRpcConnection {
   private readonly maxLineBytes: number;
   private readonly maxPendingRequests: number;
   private readonly onNotification: (notification: JsonRpcNotification) => void;
+  private readonly onServerRequest:
+    ((request: JsonRpcServerRequest) => void) | undefined;
   private readonly onFailure: (error: AgentAdapterError) => void;
   private readonly fragments: Buffer[] = [];
   private fragmentBytes = 0;
@@ -62,6 +71,7 @@ export class JsonRpcConnection {
     this.maxPendingRequests =
       options.maxPendingRequests ?? MAX_PENDING_REQUESTS;
     this.onNotification = options.onNotification ?? (() => undefined);
+    this.onServerRequest = options.onServerRequest;
     this.onFailure = options.onFailure ?? (() => undefined);
 
     stdin.on("error", () =>
@@ -211,7 +221,23 @@ export class JsonRpcConnection {
           this.fail(new AgentAdapterError("app_server_protocol_error"));
           return;
         }
-        this.fail(new AgentAdapterError("app_server_protocol_error"));
+        this.writeMessage({
+          id: value.id,
+          error: { code: -32601, message: "Method not supported" },
+        });
+        if (!this.onServerRequest) {
+          this.fail(new AgentAdapterError("app_server_protocol_error"));
+          return;
+        }
+        try {
+          this.onServerRequest({
+            id: value.id,
+            method: value.method,
+            params: value.params,
+          });
+        } catch {
+          this.fail(new AgentAdapterError("app_server_protocol_error"));
+        }
         return;
       }
       try {
@@ -256,6 +282,7 @@ export class JsonRpcConnection {
           rpcError.code === -32601
             ? "app_server_incompatible"
             : "app_server_protocol_error",
+          { requestRejected: true },
         ),
       );
       return;

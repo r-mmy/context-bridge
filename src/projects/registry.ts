@@ -11,7 +11,10 @@ import {
 } from "node:fs/promises";
 import path from "node:path";
 import { getConfigDirectory, getRegistryPath } from "../config/paths.js";
-import { withConfigMutationLock } from "../locks/file-lock.js";
+import {
+  tryAcquireProjectWriterLock,
+  withConfigMutationLock,
+} from "../locks/file-lock.js";
 import { ContextBridgeError } from "../security/errors.js";
 import { isSensitiveProjectRoot } from "../security/paths.js";
 
@@ -262,17 +265,35 @@ export async function removeProject(id: string): Promise<ProjectRecord> {
         "project_not_found",
         `No registered project has ID "${id}".`,
       );
-    const [removed] = registry.projects.splice(index, 1);
-    // Policy entries intentionally remain as stale records. This single
-    // atomic registry replacement is enough: after removal the policy is not
-    // registered, and a later add gets a new UUID before it can match again.
-    await persistRegistry(registry);
-    if (!removed)
+    const current = registry.projects[index];
+    if (!current) {
       throw new ContextBridgeError(
         "project_not_found",
         `No registered project has ID "${id}".`,
       );
-    return removed;
+    }
+    const projectLock = await tryAcquireProjectWriterLock(current.root);
+    if (!projectLock) {
+      throw new ContextBridgeError(
+        "project_busy",
+        "The project has an active agent task and cannot be removed yet.",
+      );
+    }
+    try {
+      const [removed] = registry.projects.splice(index, 1);
+      // Policy entries intentionally remain as stale records. This single
+      // atomic registry replacement is enough: after removal the policy is not
+      // registered, and a later add gets a new UUID before it can match again.
+      await persistRegistry(registry);
+      if (!removed)
+        throw new ContextBridgeError(
+          "project_not_found",
+          `No registered project has ID "${id}".`,
+        );
+      return removed;
+    } finally {
+      await projectLock.release();
+    }
   });
 }
 

@@ -4,6 +4,7 @@ import {
   mkdir,
   readFile,
   readdir,
+  rename as renamePath,
   rm,
   writeFile,
 } from "node:fs/promises";
@@ -195,6 +196,43 @@ describe.sequential("task persistence and manager", () => {
     expect(
       (await harness.store.read(record.task_id)).detected_codex_version,
     ).toBe("1.2.3");
+  });
+
+  it("retries bounded transient Windows denials during atomic task replacement", async () => {
+    let renameCalls = 0;
+    let keepFailing = false;
+    const store = new TaskStore({
+      platform: "win32",
+      renameFile: async (source, destination) => {
+        renameCalls += 1;
+        if (keepFailing || renameCalls <= 2) {
+          throw Object.assign(new Error("temporary file sharing denial"), {
+            code: "EPERM",
+          });
+        }
+        await renamePath(source, destination);
+      },
+    });
+    const harness = await createHarness(store);
+    const { allocation, record } = await createTask(harness);
+    record.detected_codex_version = "1.2.3";
+
+    await store.replace(record);
+    expect(renameCalls).toBe(3);
+    expect((await store.read(allocation.task_id)).detected_codex_version).toBe(
+      "1.2.3",
+    );
+
+    keepFailing = true;
+    renameCalls = 0;
+    record.detected_codex_version = "1.2.4";
+    await expect(store.replace(record)).rejects.toMatchObject({
+      code: "task_store_error",
+    });
+    expect(renameCalls).toBe(6);
+    expect((await store.read(allocation.task_id)).detected_codex_version).toBe(
+      "1.2.3",
+    );
   });
 
   it("accepts future local-action states and initializes the approved usage shape", async () => {

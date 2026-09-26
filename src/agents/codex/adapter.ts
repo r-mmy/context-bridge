@@ -1,4 +1,12 @@
-import type { AgentAdapter, AgentBackendInfo, AgentModel } from "../adapter.js";
+import type {
+  AgentAdapter,
+  AgentBackendInfo,
+  AgentExecutionAdapter,
+  AgentExecutionEvent,
+  AgentExecutionThread,
+  AgentExecutionTurn,
+  AgentModel,
+} from "../adapter.js";
 import { validateProfileCapabilities } from "../adapter.js";
 import { AgentAdapterError } from "../errors.js";
 import type { AgentProfile } from "../profiles.js";
@@ -72,7 +80,7 @@ function parseModelPage(value: unknown): {
   };
 }
 
-export class CodexAgentAdapter implements AgentAdapter {
+export class CodexAgentAdapter implements AgentExecutionAdapter {
   private readonly appServer: CodexAppServer;
 
   constructor(options: AppServerOptions = {}) {
@@ -150,9 +158,210 @@ export class CodexAgentAdapter implements AgentAdapter {
     validateProfileCapabilities(profile, await this.listModels());
   }
 
+  subscribe(listener: (event: AgentExecutionEvent) => void): () => void {
+    return this.appServer.subscribe((event) => {
+      if (event.type === "failure") {
+        listener({ type: "session_failed" });
+        return;
+      }
+      if (event.type === "server_request") {
+        const params = isRecord(event.value.params)
+          ? event.value.params
+          : undefined;
+        const threadId = boundedIdentifier(params?.threadId);
+        const turnId = boundedIdentifier(params?.turnId);
+        listener({
+          type: "unsupported_request",
+          ...(threadId ? { threadId } : {}),
+          ...(turnId ? { turnId } : {}),
+        });
+        return;
+      }
+      const { method, params } = event.value;
+      if (!isRecord(params)) {
+        if (
+          method === "turn/started" ||
+          method === "turn/completed" ||
+          method === "item/completed"
+        ) {
+          listener({ type: "session_failed" });
+        }
+        return;
+      }
+      const threadId = boundedIdentifier(params.threadId);
+      if (!threadId) {
+        if (
+          method === "turn/started" ||
+          method === "turn/completed" ||
+          method === "item/completed"
+        ) {
+          listener({ type: "session_failed" });
+        }
+        return;
+      }
+      if (method === "turn/started" || method === "turn/completed") {
+        const turn = isRecord(params.turn) ? params.turn : undefined;
+        const turnId = boundedIdentifier(turn?.id);
+        if (!turn || !turnId) {
+          listener({ type: "session_failed" });
+          return;
+        }
+        if (method === "turn/started") {
+          listener({ type: "turn_started", threadId, turnId });
+          return;
+        }
+        const status = turn.status;
+        if (
+          status !== "completed" &&
+          status !== "interrupted" &&
+          status !== "failed"
+        ) {
+          listener({ type: "session_failed" });
+          return;
+        }
+        listener({ type: "turn_completed", threadId, turnId, status });
+        return;
+      }
+      if (method === "item/completed" && isRecord(params.item)) {
+        const item = params.item;
+        const turnId = boundedIdentifier(params.turnId);
+        if (!turnId) {
+          listener({ type: "session_failed" });
+          return;
+        }
+        if (
+          item.type === "agentMessage" &&
+          item.phase === "final_answer" &&
+          typeof item.text === "string"
+        ) {
+          listener({
+            type: "final_message",
+            threadId,
+            turnId,
+            text: item.text,
+          });
+        }
+      }
+    });
+  }
+
+  async startThread(input: {
+    root: string;
+    model: string;
+  }): Promise<AgentExecutionThread> {
+    const result = await this.appServer.startThread({
+      model: input.model,
+      allowProviderModelFallback: false,
+      cwd: input.root,
+      runtimeWorkspaceRoots: [input.root],
+      approvalPolicy: "never",
+      sandbox: "workspace-write",
+    });
+    const sandbox =
+      isRecord(result) && isRecord(result.sandbox) ? result.sandbox : undefined;
+    const writableRoots = sandbox?.writableRoots;
+    const invalidWritableRoots =
+      writableRoots !== undefined &&
+      (!Array.isArray(writableRoots) ||
+        writableRoots.some((root) => typeof root !== "string") ||
+        (Array.isArray(writableRoots) &&
+          writableRoots.length > 0 &&
+          (writableRoots.length !== 1 || writableRoots[0] !== input.root)));
+    if (
+      !isRecord(result) ||
+      !isRecord(result.thread) ||
+      typeof result.thread.id !== "string" ||
+      result.thread.id.length === 0 ||
+      result.thread.id.length > 512 ||
+      result.model !== input.model ||
+      result.cwd !== input.root ||
+      result.approvalPolicy !== "never" ||
+      !sandbox ||
+      sandbox.type !== "workspaceWrite" ||
+      (sandbox.networkAccess !== undefined &&
+        typeof sandbox.networkAccess !== "boolean") ||
+      sandbox.networkAccess === true ||
+      (sandbox.excludeTmpdirEnvVar !== undefined &&
+        typeof sandbox.excludeTmpdirEnvVar !== "boolean") ||
+      (sandbox.excludeSlashTmp !== undefined &&
+        typeof sandbox.excludeSlashTmp !== "boolean") ||
+      invalidWritableRoots ||
+      !Array.isArray(result.runtimeWorkspaceRoots) ||
+      result.runtimeWorkspaceRoots.length !== 1 ||
+      result.runtimeWorkspaceRoots[0] !== input.root ||
+      typeof result.modelProvider !== "string" ||
+      result.modelProvider.length === 0 ||
+      result.modelProvider.length > 128 ||
+      !Object.hasOwn(result, "approvalsReviewer")
+    ) {
+      throw new AgentAdapterError("app_server_incompatible");
+    }
+    return { threadId: result.thread.id };
+  }
+
+  async startTurn(input: {
+    threadId: string;
+    root: string;
+    model: string;
+    effort: string;
+    prompt: string;
+  }): Promise<AgentExecutionTurn> {
+    const result = await this.appServer.startTurn({
+      threadId: input.threadId,
+      input: [{ type: "text", text: input.prompt }],
+      cwd: input.root,
+      runtimeWorkspaceRoots: [input.root],
+      approvalPolicy: "never",
+      sandboxPolicy: {
+        type: "workspaceWrite",
+        writableRoots: [input.root],
+        networkAccess: false,
+        excludeTmpdirEnvVar: true,
+        excludeSlashTmp: true,
+      },
+      model: input.model,
+      effort: input.effort,
+    });
+    if (
+      !isRecord(result) ||
+      !isRecord(result.turn) ||
+      typeof result.turn.id !== "string" ||
+      result.turn.id.length === 0 ||
+      result.turn.id.length > 512 ||
+      !["completed", "interrupted", "failed", "inProgress"].includes(
+        String(result.turn.status),
+      )
+    ) {
+      throw new AgentAdapterError("app_server_incompatible");
+    }
+    return {
+      turnId: result.turn.id,
+      status: result.turn.status as AgentExecutionTurn["status"],
+    };
+  }
+
+  async interruptTurn(input: {
+    threadId: string;
+    turnId: string;
+  }): Promise<void> {
+    const result = await this.appServer.interruptTurn(input);
+    if (
+      result !== null &&
+      (!isRecord(result) || Object.keys(result).length > 0)
+    ) {
+      throw new AgentAdapterError("app_server_incompatible");
+    }
+  }
+
   async close(): Promise<void> {
     await this.appServer.close();
   }
+}
+
+function boundedIdentifier(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 && value.length <= 512
+    ? value
+    : undefined;
 }
 
 let sharedCodexAdapter: CodexAgentAdapter | undefined;

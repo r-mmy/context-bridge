@@ -189,7 +189,17 @@ describe("Codex App Server adapter", () => {
     const childEnvironment = harness.launches[0]?.env ?? {};
     const expectedKeys =
       process.platform === "win32"
-        ? ["CODEX_HOME", "PATH", "SYSTEMROOT", "TEMP", "TMP"]
+        ? [
+            "APPDATA",
+            "CODEX_HOME",
+            "HOME",
+            "LOCALAPPDATA",
+            "PATH",
+            "SYSTEMROOT",
+            "TEMP",
+            "TMP",
+            "USERPROFILE",
+          ]
         : ["CODEX_HOME", "PATH", "HOME", "TMPDIR", "LANG", "LC_ALL"];
     expect(Object.keys(childEnvironment).sort()).toEqual(expectedKeys.sort());
     expect(childEnvironment.CODEX_HOME).toBe(
@@ -230,7 +240,17 @@ describe("Codex App Server adapter", () => {
       Object.keys(
         buildCodexChildEnvironment("win32", source, "C:\\Users\\tester"),
       ).sort(),
-    ).toEqual(["CODEX_HOME", "PATH", "SYSTEMROOT", "TEMP", "TMP"]);
+    ).toEqual([
+      "APPDATA",
+      "CODEX_HOME",
+      "HOME",
+      "LOCALAPPDATA",
+      "PATH",
+      "SYSTEMROOT",
+      "TEMP",
+      "TMP",
+      "USERPROFILE",
+    ]);
     expect(
       Object.keys(
         buildCodexChildEnvironment("linux", source, "/home/tester"),

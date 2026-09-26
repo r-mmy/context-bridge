@@ -24,6 +24,7 @@ import {
   summarizePrompt,
   truncateUtf8,
   type FinalResponse,
+  type GitBaseline,
   type IdempotencyRecord,
   type SafeTaskErrorCode,
   type TaskEvent,
@@ -331,6 +332,7 @@ export class TaskManager {
 
   async createTaskIntent(
     input: CreateTaskIntentInput,
+    requestLockHeld = false,
   ): Promise<TaskAllocation> {
     this.assertOwner();
     const parsed = StartIntentSchema.safeParse(input);
@@ -451,9 +453,55 @@ export class TaskManager {
         return { task_id: taskId, turn_number: 1, replayed: false };
       });
     };
-    return requestHash
+    return requestHash && !requestLockHeld
       ? this.withKeyQueue(this.requestQueues, requestHash, operation)
       : operation();
+  }
+
+  async withStartRequestLock<T>(
+    requestId: string | undefined,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    this.assertOwner();
+    if (requestId === undefined) return operation();
+    const requestHash = hashRequestId(requestId);
+    return this.withKeyQueue(this.requestQueues, requestHash, operation);
+  }
+
+  async findStartReplay(
+    input: CreateTaskIntentInput,
+  ): Promise<TaskAllocation | undefined> {
+    this.assertOwner();
+    const parsed = StartIntentSchema.safeParse(input);
+    if (!parsed.success) throw new TaskError("task_invalid_input");
+    const intent = parsed.data;
+    if (!intent.request_id) return undefined;
+    let prompt;
+    try {
+      prompt = summarizePrompt(intent.prompt);
+    } catch {
+      throw new TaskError("task_invalid_input");
+    }
+    const payload = START_IDEMPOTENCY_SCHEMA.safeParse({
+      operation: "start",
+      project_id: intent.project_id,
+      display_name: intent.display_name,
+      registration_id: intent.registration_id.toLowerCase(),
+      registration_added_at: intent.registration_added_at,
+      prompt_sha256: prompt.prompt_sha256,
+      profile: intent.profile,
+      model_id: intent.model_id,
+      mode: intent.mode ?? "default",
+    });
+    if (!payload.success) throw new TaskError("task_store_error");
+    const payloadHash = canonicalPayloadHash(
+      payload.data as unknown as Record<string, string | number>,
+    );
+    return this.findReplay(
+      hashRequestId(intent.request_id),
+      payloadHash,
+      "start",
+    );
   }
 
   async appendTurnIntent(
@@ -682,6 +730,22 @@ export class TaskManager {
         },
         record.updated_at,
       );
+      await this.persistReplacement(record);
+      this.signals.notify(taskId);
+    });
+  }
+
+  async setGitBaseline(taskId: string, baseline: GitBaseline): Promise<void> {
+    this.assertOwner();
+    taskId = normalizeTaskId(taskId);
+    await this.withKeyQueue(this.taskQueues, taskId, async () => {
+      const record = await this.store.read(taskId);
+      const turn = record.turns.at(-1);
+      if (!turn || turn.state !== "queued") {
+        throw new TaskError("task_state_conflict");
+      }
+      turn.git_baseline = structuredClone(baseline);
+      record.updated_at = new Date().toISOString();
       await this.persistReplacement(record);
       this.signals.notify(taskId);
     });

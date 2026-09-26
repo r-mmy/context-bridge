@@ -4,7 +4,11 @@ import { chmod, mkdir, open, readFile, rename, rm } from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
 import { getAgentPolicyPath, getConfigDirectory } from "../config/paths.js";
-import { withConfigMutationLock } from "../locks/file-lock.js";
+import {
+  acquireConfigMutationLock,
+  tryAcquireProjectWriterLock,
+  withConfigMutationLock,
+} from "../locks/file-lock.js";
 import {
   ensureProjectRegistrationIdentity,
   getProject,
@@ -377,21 +381,39 @@ export function sameProjectRegistration(
 export async function disableProjectAuthorization(
   project: ProjectRecord,
 ): Promise<boolean> {
-  return mutateAgentPolicy(async (policy) => {
+  const configLock = await acquireConfigMutationLock();
+  let projectLock: Awaited<ReturnType<typeof tryAcquireProjectWriterLock>> =
+    undefined;
+  try {
+    const policy = await readAgentPolicy();
     const registry = await readRegistry();
     const current = registry.projects.find((entry) => entry.id === project.id);
     if (!current || !sameProjectRegistration(project, current)) {
-      return { value: false, changed: false };
+      return false;
     }
     const existing = Object.hasOwn(policy.projects, project.id)
       ? policy.projects[project.id]
       : undefined;
     if (!existing || !authorizationMatchesProject(existing, current))
-      return { value: false, changed: false };
-    if (!existing.enabled) return { value: false, changed: false };
+      return false;
+    if (!existing.enabled) return false;
+    projectLock = await tryAcquireProjectWriterLock(current.root);
+    if (!projectLock) {
+      throw new ContextBridgeError(
+        "project_busy",
+        "The project has an active agent task and cannot be disabled yet.",
+      );
+    }
     policy.projects[project.id] = { ...existing, enabled: false };
-    return { value: true };
-  });
+    await persistAgentPolicy(policy);
+    return true;
+  } finally {
+    try {
+      await projectLock?.release();
+    } finally {
+      await configLock.release();
+    }
+  }
 }
 
 export async function setProjectAllowedProfiles(

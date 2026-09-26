@@ -30,6 +30,13 @@ import {
 
 const TASK_FILENAME =
   /^([0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.json$/;
+const WINDOWS_RENAME_RETRY_DELAYS_MS = [10, 25, 50, 100, 200] as const;
+const WINDOWS_RENAME_RETRYABLE_CODES = new Set(["EPERM", "EACCES", "EBUSY"]);
+
+interface TaskStoreOptions {
+  platform?: NodeJS.Platform;
+  renameFile?: (source: string, destination: string) => Promise<void>;
+}
 
 function codeIs(error: unknown, code: string): boolean {
   return (
@@ -82,6 +89,17 @@ async function syncDirectory(directory: string): Promise<void> {
 }
 
 export class TaskStore {
+  private readonly platform: NodeJS.Platform;
+  private readonly renameFile: (
+    source: string,
+    destination: string,
+  ) => Promise<void>;
+
+  constructor(options: TaskStoreOptions = {}) {
+    this.platform = options.platform ?? process.platform;
+    this.renameFile = options.renameFile ?? rename;
+  }
+
   async initialize(): Promise<void> {
     try {
       const configDirectory = getConfigDirectory();
@@ -211,13 +229,35 @@ export class TaskStore {
       await handle.sync();
       await handle.close();
       handle = undefined;
-      await rename(temporary, target);
+      await this.renameReplacement(temporary, target);
       await syncDirectory(getTasksDirectory());
     } catch (error) {
       if (handle) await handle.close().catch(() => undefined);
       await rm(temporary, { force: true }).catch(() => undefined);
       if (isTaskError(error)) throw error;
       throw new TaskError("task_store_error");
+    }
+  }
+
+  private async renameReplacement(
+    source: string,
+    destination: string,
+  ): Promise<void> {
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        await this.renameFile(source, destination);
+        return;
+      } catch (error) {
+        const delayMs =
+          this.platform === "win32"
+            ? WINDOWS_RENAME_RETRY_DELAYS_MS[attempt]
+            : undefined;
+        const retryable = [...WINDOWS_RENAME_RETRYABLE_CODES].some((code) =>
+          codeIs(error, code),
+        );
+        if (delayMs === undefined || !retryable) throw error;
+        await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+      }
     }
   }
 

@@ -1,11 +1,14 @@
-import { appendFileSync } from "node:fs";
+import { appendFileSync, writeFileSync } from "node:fs";
+import path from "node:path";
 import process from "node:process";
-import { setInterval } from "node:timers";
+import { setInterval, setTimeout } from "node:timers";
 
 const mode = process.argv[2] ?? "normal";
 const tracePath = process.argv[3];
+const startupMutationRoot = process.argv[4];
 let input = "";
 const queuedRequests = [];
+let executionTurnStartCount = 0;
 
 if (mode === "version") {
   process.stdout.write("codex-cli 0.155.0-alpha.16.3\n", () => process.exit(0));
@@ -35,6 +38,17 @@ function accountResult() {
 
 function modelPage(params) {
   if (mode === "malformed-models") return { data: "invalid" };
+  if (mode === "model-unavailable") {
+    return {
+      data: [
+        {
+          id: "gpt-6-sol",
+          supportedReasoningEfforts: [{ reasoningEffort: "high" }],
+        },
+      ],
+      nextCursor: null,
+    };
+  }
   if (mode === "paginated-models" && params.cursor === "page-2") {
     return {
       data: [
@@ -80,6 +94,13 @@ function processRequest(request) {
   });
 
   if (request.method === "initialize") {
+    if (mode === "startup-artifact" && startupMutationRoot) {
+      writeFileSync(
+        path.join(startupMutationRoot, "synthetic-artifact.txt"),
+        "created by the fake App Server\n",
+        "utf8",
+      );
+    }
     record({
       kind: "environment-check",
       hasOpenAiKey: Object.hasOwn(process.env, "OPENAI_API_KEY"),
@@ -181,6 +202,245 @@ function processRequest(request) {
       return;
     }
     send(response);
+    return;
+  }
+
+  if (request.method === "thread/start") {
+    const params = request.params ?? {};
+    const executionThreadId = `fake-thread-${request.id}`;
+    const root = params.runtimeWorkspaceRoots?.[0];
+    record({
+      kind: "thread-security-check",
+      oneRuntimeRoot: params.runtimeWorkspaceRoots?.length === 1,
+      cwdMatchesRoot: params.cwd === root,
+      approvalNever: params.approvalPolicy === "never",
+      workspaceWrite: params.sandbox === "workspace-write",
+      noProviderFallback: params.allowProviderModelFallback === false,
+      noConfigOverride: !Object.hasOwn(params, "config"),
+      noAdditionalWritableRoots: true,
+      model: params.model,
+    });
+    const response = {
+      id: request.id,
+      result: {
+        thread: { id: executionThreadId },
+        model: params.model,
+        modelProvider: "openai",
+        serviceTier: null,
+        cwd: params.cwd,
+        runtimeWorkspaceRoots: params.runtimeWorkspaceRoots,
+        instructionSources: [],
+        approvalPolicy: params.approvalPolicy,
+        approvalsReviewer: null,
+        sandbox: {
+          type: "workspaceWrite",
+          writableRoots: [root],
+          networkAccess: false,
+          excludeTmpdirEnvVar: true,
+          excludeSlashTmp: true,
+        },
+        activePermissionProfile: null,
+        reasoningEffort: "max",
+        multiAgentMode: "explicitRequestOnly",
+      },
+    };
+    if (mode === "wrong-thread-roots") {
+      response.result.runtimeWorkspaceRoots = [];
+    }
+    send(response);
+    return;
+  }
+
+  if (request.method === "turn/start") {
+    const params = request.params ?? {};
+    const policy = params.sandboxPolicy ?? {};
+    const root = params.runtimeWorkspaceRoots?.[0];
+    executionTurnStartCount += 1;
+    record({
+      kind: "execution-security-check",
+      oneRuntimeRoot: params.runtimeWorkspaceRoots?.length === 1,
+      cwdMatchesRoot: params.cwd === root,
+      oneWritableRoot: policy.writableRoots?.length === 1,
+      writableRootMatches: policy.writableRoots?.[0] === root,
+      approvalNever: params.approvalPolicy === "never",
+      networkDisabled: policy.networkAccess === false,
+      excludesTemp: policy.excludeTmpdirEnvVar === true,
+      excludesSlashTmp: policy.excludeSlashTmp === true,
+      defaultMode: !Object.hasOwn(params, "collaborationMode"),
+      oneTextInput:
+        params.input?.length === 1 && params.input[0]?.type === "text",
+      model: params.model,
+      effort: params.effort,
+    });
+    const executionTurnId = `fake-turn-${request.id}`;
+    if (mode === "turn-start-rejected") {
+      send({
+        id: request.id,
+        error: {
+          code: -32603,
+          message: "PRIVATE_TURN_START_ERROR C:\\local\\private\\path",
+        },
+      });
+      return;
+    }
+    if (mode === "turn-start-lost-response") process.exit(24);
+    if (
+      mode === "terminal-start-result" ||
+      mode === "terminal-start-result-with-notification"
+    ) {
+      send({
+        id: request.id,
+        result: {
+          turn: { id: executionTurnId, status: "completed", items: [] },
+        },
+      });
+      if (mode === "terminal-start-result-with-notification") {
+        setTimeout(() => {
+          send({
+            method: "turn/completed",
+            params: {
+              threadId: params.threadId,
+              turn: { id: executionTurnId, status: "completed", items: [] },
+            },
+          });
+        }, 1);
+      }
+      return;
+    }
+    if (mode === "server-request" || mode === "execution-server-request") {
+      send({
+        id: "ephemeral-private-server-request-id",
+        method: "item/tool/requestUserInput",
+        params: {
+          threadId: params.threadId,
+          turnId: executionTurnId,
+          questions: [{ question: "private question text" }],
+        },
+      });
+    }
+    send({
+      method: "turn/started",
+      params: {
+        threadId: params.threadId,
+        turn: { id: executionTurnId, status: "inProgress", items: [] },
+      },
+    });
+    send({
+      method: "item/started",
+      params: {
+        threadId: params.threadId,
+        turnId: executionTurnId,
+        item: {
+          id: "private-command-item",
+          type: "commandExecution",
+          command: "not captured",
+        },
+      },
+    });
+    if (mode === "process-death") {
+      send({
+        id: request.id,
+        result: { turn: { id: executionTurnId, status: "inProgress" } },
+      });
+      setTimeout(() => process.exit(23), 10);
+      return;
+    }
+    send({
+      id: request.id,
+      result: { turn: { id: executionTurnId, status: "inProgress" } },
+    });
+    if (
+      mode === "execution-uncorrelated-after-two" &&
+      executionTurnStartCount === 2
+    ) {
+      setTimeout(() => {
+        send({
+          id: "ephemeral-uncorrelated-request-id",
+          method: "item/tool/requestUserInput",
+          params: {
+            threadId: "unknown-private-thread-id",
+            turnId: "unknown-private-turn-id",
+            questions: [{ question: "uncorrelated private question" }],
+          },
+        });
+      }, 100);
+    }
+    const complete = () => {
+      if (mode === "delayed-turn") return;
+      send({
+        method: "item/completed",
+        params: {
+          threadId: params.threadId,
+          turnId: executionTurnId,
+          item: {
+            id: "private-final-item",
+            type: "agentMessage",
+            phase: "final_answer",
+            text:
+              mode === "huge-final"
+                ? "x".repeat(70 * 1024)
+                : "Changed value.txt from alpha to beta.",
+          },
+        },
+      });
+      if (mode !== "server-request" && mode !== "execution-server-request") {
+        send({
+          method: "turn/completed",
+          params: {
+            threadId: params.threadId,
+            turn: {
+              id: executionTurnId,
+              status:
+                mode === "turn-failed" ||
+                (mode === "terminal-mapping" && executionTurnStartCount === 1)
+                  ? "failed"
+                  : mode === "turn-interrupted" ||
+                      (mode === "terminal-mapping" &&
+                        executionTurnStartCount === 2)
+                    ? "interrupted"
+                    : "completed",
+              items: [],
+            },
+          },
+        });
+      }
+    };
+    if (
+      mode === "delayed-turn" ||
+      mode === "delayed-interrupt" ||
+      mode === "interrupt-failure" ||
+      mode === "execution-uncorrelated-after-two"
+    ) {
+      return;
+    }
+    setTimeout(complete, 5);
+    return;
+  }
+
+  if (request.method === "turn/interrupt") {
+    const settleInterrupt = () => {
+      if (mode === "interrupt-failure") {
+        send({
+          id: request.id,
+          error: { code: -32603, message: "private interrupt error" },
+        });
+        return;
+      }
+      send({
+        method: "turn/completed",
+        params: {
+          threadId: request.params?.threadId,
+          turn: {
+            id: request.params?.turnId,
+            status: "interrupted",
+            items: [],
+          },
+        },
+      });
+      send({ id: request.id, result: {} });
+    };
+    if (mode === "delayed-interrupt") setTimeout(settleInterrupt, 100);
+    else settleInterrupt();
   }
 }
 

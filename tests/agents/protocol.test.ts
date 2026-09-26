@@ -68,7 +68,38 @@ describe("bounded App Server JSONL protocol", () => {
     await expect(pending).rejects.toMatchObject({
       code: "app_server_protocol_error",
     });
-    expect(state.sent).toHaveLength(1);
+    expect(state.sent).toHaveLength(2);
+    expect(state.sent[1]).toEqual({
+      id: 1,
+      error: { code: -32601, message: "Method not supported" },
+    });
+  });
+
+  it("rejects but reports a server request to the private execution router", async () => {
+    const requests: unknown[] = [];
+    const state = connection({
+      onServerRequest: (request) => requests.push(request),
+    });
+    const pending = state.client.request("safe/read", {});
+    respond(state.stdout, {
+      id: "private-upstream-id",
+      method: "item/tool/requestUserInput",
+      params: { threadId: "private-thread", turnId: "private-turn" },
+    });
+    respond(state.stdout, { id: 1, result: { ok: true } });
+
+    await expect(pending).resolves.toEqual({ ok: true });
+    expect(requests).toEqual([
+      {
+        id: "private-upstream-id",
+        method: "item/tool/requestUserInput",
+        params: { threadId: "private-thread", turnId: "private-turn" },
+      },
+    ]);
+    expect(state.sent[1]).toEqual({
+      id: "private-upstream-id",
+      error: { code: -32601, message: "Method not supported" },
+    });
   });
 
   it.each([

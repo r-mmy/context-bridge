@@ -6,7 +6,12 @@ import {
 import os from "node:os";
 import path from "node:path";
 import { AgentAdapterError, safeAgentAdapterError } from "../errors.js";
-import { DEFAULT_REQUEST_TIMEOUT_MS, JsonRpcConnection } from "./protocol.js";
+import {
+  DEFAULT_REQUEST_TIMEOUT_MS,
+  JsonRpcConnection,
+  type JsonRpcNotification,
+  type JsonRpcServerRequest,
+} from "./protocol.js";
 
 const CODEX_EXECUTABLE = "codex";
 const CODEX_ARGUMENTS = ["app-server", "--listen", "stdio://"];
@@ -34,6 +39,11 @@ export interface AppServerOptions {
   shutdownTimeoutMs?: number;
 }
 
+type AppServerEvent =
+  | { type: "notification"; value: JsonRpcNotification }
+  | { type: "server_request"; value: JsonRpcServerRequest }
+  | { type: "failure" };
+
 function addIfPresent(
   output: NodeJS.ProcessEnv,
   key: string,
@@ -54,6 +64,19 @@ export function buildCodexChildEnvironment(
   addIfPresent(output, "PATH", source.PATH);
 
   if (platform === "win32") {
+    const userProfile = source.USERPROFILE || homeDirectory;
+    addIfPresent(output, "USERPROFILE", userProfile);
+    addIfPresent(output, "HOME", source.HOME || userProfile);
+    addIfPresent(
+      output,
+      "APPDATA",
+      source.APPDATA || join(userProfile, "AppData", "Roaming"),
+    );
+    addIfPresent(
+      output,
+      "LOCALAPPDATA",
+      source.LOCALAPPDATA || join(userProfile, "AppData", "Local"),
+    );
     addIfPresent(output, "SYSTEMROOT", source.SYSTEMROOT ?? source.SystemRoot);
     addIfPresent(output, "TEMP", source.TEMP ?? source.Tmp);
     addIfPresent(output, "TMP", source.TMP ?? source.Tmp);
@@ -115,12 +138,21 @@ class AppServerSession {
   constructor(
     readonly child: ChildProcessWithoutNullStreams,
     private readonly requestTimeoutMs: number,
+    private readonly emit: (event: AppServerEvent) => boolean,
   ) {
     this.closed = new Promise((resolve) => {
       this.resolveClosed = resolve;
     });
     this.connection = new JsonRpcConnection(child.stdin, child.stdout, {
       requestTimeoutMs,
+      onNotification: (value) => {
+        this.emit({ type: "notification", value });
+      },
+      onServerRequest: (value) => {
+        if (!this.emit({ type: "server_request", value })) {
+          this.fail(new AgentAdapterError("app_server_protocol_error"));
+        }
+      },
       onFailure: (error) => this.fail(error),
     });
 
@@ -220,6 +252,7 @@ class AppServerSession {
   private fail(error: AgentAdapterError): void {
     if (this.failure) return;
     this.failure = error;
+    this.emit({ type: "failure" });
     this.connection.fail(error, false);
     if (!this.closedState && !this.stopping) {
       try {
@@ -241,6 +274,7 @@ export class CodexAppServer {
   private session: AppServerSession | undefined;
   private starting: Promise<AppServerInfo> | undefined;
   private cliVersion: Promise<string | null> | undefined;
+  private readonly listeners = new Set<(event: AppServerEvent) => void>();
 
   constructor(options: AppServerOptions = {}) {
     this.spawnProcess =
@@ -289,6 +323,51 @@ export class CodexAppServer {
     });
   }
 
+  subscribe(listener: (event: AppServerEvent) => void): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+
+  async startThread(params: {
+    model: string;
+    allowProviderModelFallback: false;
+    cwd: string;
+    runtimeWorkspaceRoots: [string];
+    approvalPolicy: "never";
+    sandbox: "workspace-write";
+  }): Promise<unknown> {
+    const session = await this.getReadySession();
+    return session.request("thread/start", params);
+  }
+
+  async startTurn(params: {
+    threadId: string;
+    input: [{ type: "text"; text: string }];
+    cwd: string;
+    runtimeWorkspaceRoots: [string];
+    approvalPolicy: "never";
+    sandboxPolicy: {
+      type: "workspaceWrite";
+      writableRoots: [string];
+      networkAccess: false;
+      excludeTmpdirEnvVar: true;
+      excludeSlashTmp: true;
+    };
+    model: string;
+    effort: string;
+  }): Promise<unknown> {
+    const session = await this.getReadySession();
+    return session.request("turn/start", params);
+  }
+
+  async interruptTurn(params: {
+    threadId: string;
+    turnId: string;
+  }): Promise<unknown> {
+    const session = await this.getReadySession();
+    return session.request("turn/interrupt", params);
+  }
+
   async close(): Promise<void> {
     const starting = this.starting;
     if (starting) await starting.catch(() => undefined);
@@ -325,7 +404,22 @@ export class CodexAppServer {
       throw safeAgentAdapterError(error);
     }
 
-    const session = new AppServerSession(child, this.requestTimeoutMs);
+    const session = new AppServerSession(
+      child,
+      this.requestTimeoutMs,
+      (event) => {
+        let handled = false;
+        for (const listener of this.listeners) {
+          try {
+            listener(event);
+            handled = true;
+          } catch {
+            // A consumer bug must not corrupt JSON-RPC framing.
+          }
+        }
+        return handled;
+      },
+    );
     this.session = session;
     try {
       const info = await session.initialize();
