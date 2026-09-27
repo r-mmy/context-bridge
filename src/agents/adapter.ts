@@ -57,6 +57,10 @@ export interface AgentExecutionAdapter extends AgentAdapter {
     prompt: string;
   }): Promise<AgentExecutionTurn>;
   interruptTurn(input: { threadId: string; turnId: string }): Promise<void>;
+  setThreadName(input: { threadId: string; name: string }): Promise<void>;
+  releaseThread(input: {
+    threadId: string;
+  }): Promise<{ closedObserved: boolean }>;
 }
 
 /** M2 only provides backend capability and local profile operations. */

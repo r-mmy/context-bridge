@@ -7,14 +7,24 @@ import os from "node:os";
 import path from "node:path";
 import { AgentAdapterError, safeAgentAdapterError } from "../errors.js";
 import {
+  PINNED_CODEX_VERSION,
+  resolveCodexRuntime,
+  type CodexRuntime,
+} from "./runtime.js";
+import {
   DEFAULT_REQUEST_TIMEOUT_MS,
   JsonRpcConnection,
   type JsonRpcNotification,
   type JsonRpcServerRequest,
 } from "./protocol.js";
 
-const CODEX_EXECUTABLE = "codex";
-const CODEX_ARGUMENTS = ["app-server", "--listen", "stdio://"];
+const CODEX_ARGUMENTS = [
+  "app-server",
+  "--config",
+  "thread_unload_delay_secs=0",
+  "--listen",
+  "stdio://",
+];
 const INITIALIZE_TIMEOUT_MS = 30_000;
 const GRACEFUL_SHUTDOWN_MS = 1_500;
 const FORCED_SHUTDOWN_MS = 500;
@@ -32,6 +42,8 @@ export interface AppServerOptions {
     args: string[],
     options: SpawnOptions,
   ) => ChildProcessWithoutNullStreams;
+  /** Internal test seam; never sourced from CLI, policy, or MCP input. */
+  resolveRuntime?: () => Promise<CodexRuntime>;
   environment?: NodeJS.ProcessEnv;
   platform?: NodeJS.Platform;
   homeDirectory?: string;
@@ -266,6 +278,9 @@ class AppServerSession {
 
 export class CodexAppServer {
   private readonly spawnProcess: NonNullable<AppServerOptions["spawnProcess"]>;
+  private readonly resolveRuntime: NonNullable<
+    AppServerOptions["resolveRuntime"]
+  >;
   private readonly environment: NodeJS.ProcessEnv;
   private readonly platform: NodeJS.Platform;
   private readonly homeDirectory: string;
@@ -273,7 +288,6 @@ export class CodexAppServer {
   private readonly shutdownTimeoutMs: number;
   private session: AppServerSession | undefined;
   private starting: Promise<AppServerInfo> | undefined;
-  private cliVersion: Promise<string | null> | undefined;
   private readonly listeners = new Set<(event: AppServerEvent) => void>();
 
   constructor(options: AppServerOptions = {}) {
@@ -285,6 +299,7 @@ export class CodexAppServer {
           args,
           spawnOptions,
         ) as ChildProcessWithoutNullStreams);
+    this.resolveRuntime = options.resolveRuntime ?? resolveCodexRuntime;
     this.environment = options.environment ?? process.env;
     this.platform = options.platform ?? process.platform;
     this.homeDirectory = options.homeDirectory ?? os.homedir();
@@ -368,6 +383,19 @@ export class CodexAppServer {
     return session.request("turn/interrupt", params);
   }
 
+  async setThreadName(params: {
+    threadId: string;
+    name: string;
+  }): Promise<unknown> {
+    const session = await this.getReadySession();
+    return session.request("thread/name/set", params);
+  }
+
+  async unsubscribeThread(params: { threadId: string }): Promise<unknown> {
+    const session = await this.getReadySession();
+    return session.request("thread/unsubscribe", params);
+  }
+
   async close(): Promise<void> {
     const starting = this.starting;
     if (starting) await starting.catch(() => undefined);
@@ -388,18 +416,47 @@ export class CodexAppServer {
     this.session = undefined;
     if (previous) await previous.close(this.shutdownTimeoutMs);
 
+    let runtime: CodexRuntime;
+    try {
+      runtime = await this.resolveRuntime();
+    } catch {
+      throw new AgentAdapterError("codex_runtime_unavailable");
+    }
+    if (
+      runtime === null ||
+      typeof runtime !== "object" ||
+      runtime.source !== "managed" ||
+      runtime.executable !== process.execPath ||
+      runtime.version !== PINNED_CODEX_VERSION ||
+      !Array.isArray(runtime.argsPrefix) ||
+      runtime.argsPrefix.length !== 1 ||
+      typeof runtime.argsPrefix[0] !== "string" ||
+      !path.isAbsolute(runtime.argsPrefix[0] ?? "")
+    ) {
+      throw new AgentAdapterError("codex_runtime_unavailable");
+    }
+
+    const runtimeVersion = await this.queryCliVersion(runtime);
+    if (runtimeVersion !== runtime.version) {
+      throw new AgentAdapterError("codex_runtime_unavailable");
+    }
+
     let child: ChildProcessWithoutNullStreams;
     try {
-      child = this.spawnProcess(CODEX_EXECUTABLE, [...CODEX_ARGUMENTS], {
-        shell: false,
-        stdio: ["pipe", "pipe", "pipe"],
-        windowsHide: this.platform === "win32",
-        env: buildCodexChildEnvironment(
-          this.platform,
-          this.environment,
-          this.homeDirectory,
-        ),
-      });
+      child = this.spawnProcess(
+        runtime.executable,
+        [...runtime.argsPrefix, ...CODEX_ARGUMENTS],
+        {
+          shell: false,
+          stdio: ["pipe", "pipe", "pipe"],
+          windowsHide: this.platform === "win32",
+          env: buildCodexChildEnvironment(
+            this.platform,
+            this.environment,
+            this.homeDirectory,
+          ),
+        },
+      );
     } catch (error) {
       throw safeAgentAdapterError(error);
     }
@@ -423,9 +480,10 @@ export class CodexAppServer {
     this.session = session;
     try {
       const info = await session.initialize();
-      if (info.version) return info;
-      this.cliVersion ??= this.queryCliVersion();
-      return { version: await this.cliVersion };
+      if (info.version && info.version !== runtime.version) {
+        throw new AgentAdapterError("app_server_incompatible");
+      }
+      return { version: info.version ?? runtimeVersion };
     } catch (error) {
       await session.close(this.shutdownTimeoutMs);
       if (this.session === session) this.session = undefined;
@@ -434,20 +492,24 @@ export class CodexAppServer {
     }
   }
 
-  private async queryCliVersion(): Promise<string | null> {
+  private async queryCliVersion(runtime: CodexRuntime): Promise<string | null> {
     return await new Promise((resolve) => {
       let child: ChildProcessWithoutNullStreams;
       try {
-        child = this.spawnProcess(CODEX_EXECUTABLE, ["--version"], {
-          shell: false,
-          stdio: ["pipe", "pipe", "pipe"],
-          windowsHide: this.platform === "win32",
-          env: buildCodexChildEnvironment(
-            this.platform,
-            this.environment,
-            this.homeDirectory,
-          ),
-        });
+        child = this.spawnProcess(
+          runtime.executable,
+          [...runtime.argsPrefix, "--version"],
+          {
+            shell: false,
+            stdio: ["pipe", "pipe", "pipe"],
+            windowsHide: this.platform === "win32",
+            env: buildCodexChildEnvironment(
+              this.platform,
+              this.environment,
+              this.homeDirectory,
+            ),
+          },
+        );
       } catch {
         resolve(null);
         return;

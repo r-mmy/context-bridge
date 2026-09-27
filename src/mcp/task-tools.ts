@@ -331,9 +331,9 @@ const SAFE_ERRORS = {
     message: "The maximum number of active agent turns has been reached.",
     retryable: true,
   },
-  codex_not_found: {
-    code: "codex_not_found",
-    message: "The Codex executable was not found on PATH.",
+  codex_runtime_unavailable: {
+    code: "codex_runtime_unavailable",
+    message: "The Context Bridge Codex runtime is unavailable.",
     retryable: false,
   },
   codex_unauthenticated: {

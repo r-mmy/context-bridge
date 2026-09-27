@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -12,6 +12,10 @@ import type { AgentProfile } from "../../src/agents/profiles.js";
 import { AgentAdapterError } from "../../src/agents/errors.js";
 import { CodexAgentAdapter } from "../../src/agents/codex/adapter.js";
 import { buildCodexChildEnvironment } from "../../src/agents/codex/app-server.js";
+import {
+  PINNED_CODEX_VERSION,
+  type CodexRuntime,
+} from "../../src/agents/codex/runtime.js";
 
 const fixturePath = fileURLToPath(
   new URL("../fixtures/fake-app-server.mjs", import.meta.url),
@@ -50,17 +54,32 @@ async function createHarness(
     requestTimeoutMs?: number;
     shutdownTimeoutMs?: number;
     throwOnSpawn?: NodeJS.ErrnoException;
+    runtime?: CodexRuntime | null;
+    runtimeError?: Error;
+    versionOutput?: string;
   } = {},
 ) {
   const directory = await mkdtemp(
     path.join(os.tmpdir(), "ctxbridge-app-server-"),
   );
   temporaryDirectories.push(directory);
+  const codexHome = path.join(directory, "home", ".codex");
+  await mkdir(codexHome, { recursive: true });
+  await writeFile(path.join(codexHome, "config.toml"), "fixture = true\n");
   const tracePath = path.join(directory, "trace.jsonl");
+  const fakeBin = path.join(directory, "fake-bin");
+  await mkdir(fakeBin);
+  await writeFile(
+    path.join(fakeBin, process.platform === "win32" ? "codex.cmd" : "codex"),
+    process.platform === "win32"
+      ? "@echo off\r\necho fake codex selected\r\n"
+      : "#!/bin/sh\necho fake codex selected\n",
+    { mode: 0o755 },
+  );
   const launches: SpawnRecord[] = [];
   const children: ChildProcessWithoutNullStreams[] = [];
   const sourceEnvironment: NodeJS.ProcessEnv = {
-    PATH: process.env.PATH ?? "",
+    PATH: [fakeBin, process.env.PATH ?? ""].join(path.delimiter),
     CODEX_HOME: undefined,
     SYSTEMROOT: process.env.SYSTEMROOT ?? "C:\\Windows",
     TEMP: process.env.TEMP ?? os.tmpdir(),
@@ -85,6 +104,20 @@ async function createHarness(
     ...(overrides.shutdownTimeoutMs === undefined
       ? {}
       : { shutdownTimeoutMs: overrides.shutdownTimeoutMs }),
+    resolveRuntime: async () => {
+      if (overrides.runtimeError) throw overrides.runtimeError;
+      if (overrides.runtime === null) {
+        throw new Error("private managed runtime path is missing");
+      }
+      return (
+        overrides.runtime ?? {
+          executable: process.execPath,
+          argsPrefix: [fixturePath],
+          version: PINNED_CODEX_VERSION,
+          source: "managed",
+        }
+      );
+    },
     spawnProcess: (executable, args, options) => {
       if (overrides.throwOnSpawn) throw overrides.throwOnSpawn;
       launches.push({
@@ -94,16 +127,22 @@ async function createHarness(
         stdio: options.stdio,
         env: { ...(options.env ?? {}) },
       });
-      const selectedMode =
-        args[0] === "--version"
-          ? "version"
-          : typeof mode === "string"
-            ? mode
-            : mode(launchIndex);
-      launchIndex += 1;
+      const isVersionQuery = args.at(-1) === "--version";
+      const selectedMode = isVersionQuery
+        ? "version"
+        : typeof mode === "string"
+          ? mode
+          : mode(launchIndex);
+      if (!isVersionQuery) launchIndex += 1;
       const child = spawn(
         process.execPath,
-        [fixturePath, selectedMode, tracePath],
+        [
+          fixturePath,
+          selectedMode,
+          tracePath,
+          "",
+          overrides.versionOutput ?? PINNED_CODEX_VERSION,
+        ],
         {
           shell: false,
           stdio: ["pipe", "pipe", "pipe"],
@@ -144,16 +183,37 @@ describe("Codex App Server adapter", () => {
       provider: "codex",
       connected: true,
       experimentalApi: true,
-      version: "0.155.0-alpha.16.3",
+      version: PINNED_CODEX_VERSION,
     });
     expect(second).toEqual(first);
-    expect(harness.launches).toHaveLength(1);
+    expect(harness.launches).toHaveLength(2);
     expect(harness.launches[0]).toMatchObject({
-      executable: "codex",
-      args: ["app-server", "--listen", "stdio://"],
+      executable: process.execPath,
+      args: [fixturePath, "--version"],
       shell: false,
       stdio: ["pipe", "pipe", "pipe"],
     });
+    expect(harness.launches[1]).toMatchObject({
+      executable: process.execPath,
+      args: [
+        fixturePath,
+        "app-server",
+        "--config",
+        "thread_unload_delay_secs=0",
+        "--listen",
+        "stdio://",
+      ],
+      shell: false,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    expect(harness.launches[1]?.env.PATH?.split(path.delimiter)[0]).toBe(
+      path.join(harness.directory, "fake-bin"),
+    );
+    expect(
+      harness.launches.some((launch) =>
+        launch.args.some((argument) => argument.includes("fake-bin")),
+      ),
+    ).toBe(false);
 
     await harness.adapter.close();
     const trace = await readTrace(harness.tracePath);
@@ -167,15 +227,29 @@ describe("Codex App Server adapter", () => {
       capabilities: { experimentalApi: true },
     });
     expect(harness.children[0]?.exitCode).toBe(0);
+    expect(harness.children[1]?.exitCode).toBe(0);
+    await expect(
+      readFile(
+        path.join(harness.directory, "home", ".codex", "config.toml"),
+        "utf8",
+      ),
+    ).resolves.toBe("fixture = true\n");
   });
 
-  it("uses only a fixed version query when the App Server does not report its version", async () => {
+  it("validates the pinned launcher version and uses it when App Server omits its version", async () => {
     const harness = await createHarness("no-server-version");
     const info = await harness.adapter.start();
-    expect(info.version).toBe("0.155.0-alpha.16.3");
+    expect(info.version).toBe(PINNED_CODEX_VERSION);
     expect(harness.launches.map((launch) => launch.args)).toEqual([
-      ["app-server", "--listen", "stdio://"],
-      ["--version"],
+      [fixturePath, "--version"],
+      [
+        fixturePath,
+        "app-server",
+        "--config",
+        "thread_unload_delay_secs=0",
+        "--listen",
+        "stdio://",
+      ],
     ]);
     expect(harness.launches.every((launch) => launch.shell === false)).toBe(
       true,
@@ -186,7 +260,7 @@ describe("Codex App Server adapter", () => {
   it("passes only the platform allowlist and derives CODEX_HOME without inheriting secrets", async () => {
     const harness = await createHarness();
     await harness.adapter.start();
-    const childEnvironment = harness.launches[0]?.env ?? {};
+    const childEnvironment = harness.launches[1]?.env ?? {};
     const expectedKeys =
       process.platform === "win32"
         ? [
@@ -352,14 +426,51 @@ describe("Codex App Server adapter", () => {
     },
   );
 
-  it("maps missing executables to a sanitized error", async () => {
+  it("fails safely when the managed runtime is missing or malformed", async () => {
+    const missing = await createHarness("normal", { runtime: null });
+    await expect(missing.adapter.start()).rejects.toMatchObject({
+      code: "codex_runtime_unavailable",
+      message: "The Context Bridge Codex runtime is unavailable.",
+    });
+    expect(missing.launches).toHaveLength(0);
+    await missing.adapter.close();
+
+    const malformed = await createHarness("normal", {
+      runtime: {
+        executable: process.execPath,
+        argsPrefix: [fixturePath],
+        version: "0.0.0",
+        source: "managed",
+      },
+    });
+    await expect(malformed.adapter.start()).rejects.toMatchObject({
+      code: "codex_runtime_unavailable",
+      message: "The Context Bridge Codex runtime is unavailable.",
+    });
+    expect(malformed.launches).toHaveLength(0);
+    await malformed.adapter.close();
+  });
+
+  it("rejects an actual launcher version that differs from the pinned package", async () => {
+    const harness = await createHarness("normal", {
+      versionOutput: "0.1.0",
+    });
+    await expect(harness.adapter.start()).rejects.toMatchObject({
+      code: "codex_runtime_unavailable",
+      message: "The Context Bridge Codex runtime is unavailable.",
+    });
+    expect(harness.launches).toHaveLength(1);
+    await harness.adapter.close();
+  });
+
+  it("maps a missing launcher process to a sanitized runtime error", async () => {
     const harness = await createHarness("normal", {
       throwOnSpawn: Object.assign(new Error("private path"), {
         code: "ENOENT",
       }),
     });
     await expect(harness.adapter.start()).rejects.toMatchObject({
-      code: "codex_not_found",
+      code: "codex_runtime_unavailable",
       message: expect.not.stringContaining("private path"),
     });
     await harness.adapter.close();
@@ -396,7 +507,7 @@ describe("Codex App Server adapter", () => {
       code: "app_server_exited",
     });
     await expect(harness.adapter.checkAuthentication()).resolves.toBe(true);
-    expect(harness.launches).toHaveLength(2);
+    expect(harness.launches).toHaveLength(4);
     await harness.adapter.close();
   });
 
@@ -409,8 +520,8 @@ describe("Codex App Server adapter", () => {
     await hanging.adapter.close();
     expect(Date.now() - started).toBeLessThan(2_000);
     expect(
-      hanging.children[0]?.exitCode !== null ||
-        hanging.children[0]?.signalCode !== null,
+      hanging.children[1]?.exitCode !== null ||
+        hanging.children[1]?.signalCode !== null,
     ).toBe(true);
 
     const rawError = await createHarness("rpc-error");

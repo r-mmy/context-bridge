@@ -6,8 +6,15 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { afterEach, describe, expect, it } from "vitest";
-import { AgentExecutionService } from "../../src/agents/execution.js";
+import {
+  AgentExecutionService,
+  makeContextBridgeThreadName,
+} from "../../src/agents/execution.js";
 import { CodexAgentAdapter } from "../../src/agents/codex/adapter.js";
+import {
+  PINNED_CODEX_VERSION,
+  type CodexRuntime,
+} from "../../src/agents/codex/runtime.js";
 import { tryAcquireProjectWriterLock } from "../../src/locks/file-lock.js";
 import {
   disableProjectAuthorization,
@@ -71,24 +78,30 @@ async function createHarness(
   const adapter = new CodexAgentAdapter({
     environment: fakeEnvironment,
     homeDirectory: path.join(root, "fake-home"),
-    spawnProcess: (_executable, _args, spawnOptions) => {
-      const child = spawn(
-        process.execPath,
-        [
-          fixturePath,
-          mode,
-          tracePath,
-          options.startupMutationProjectName
-            ? path.join(root, options.startupMutationProjectName)
-            : "",
-        ],
-        {
-          shell: false,
-          stdio: ["pipe", "pipe", "pipe"],
-          env: spawnOptions.env,
-          windowsHide: true,
-        },
-      ) as ChildProcessWithoutNullStreams;
+    resolveRuntime: async (): Promise<CodexRuntime> => ({
+      executable: process.execPath,
+      argsPrefix: [fixturePath],
+      version: PINNED_CODEX_VERSION,
+      source: "managed",
+    }),
+    spawnProcess: (_executable, args, spawnOptions) => {
+      const command =
+        args.at(-1) === "--version"
+          ? [fixturePath, "version", tracePath, "", PINNED_CODEX_VERSION]
+          : [
+              fixturePath,
+              mode,
+              tracePath,
+              options.startupMutationProjectName
+                ? path.join(root, options.startupMutationProjectName)
+                : "",
+            ];
+      const child = spawn(process.execPath, command, {
+        shell: false,
+        stdio: ["pipe", "pipe", "pipe"],
+        env: spawnOptions.env,
+        windowsHide: true,
+      }) as ChildProcessWithoutNullStreams;
       children.push(child);
       return child;
     },
@@ -212,6 +225,24 @@ async function traceMethods(harness: Harness): Promise<string[]> {
     .map((entry) => entry.method);
 }
 
+async function waitForTraceMethod(
+  harness: Harness,
+  method: string,
+): Promise<Record<string, unknown>> {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    const content = await readFile(harness.tracePath, "utf8").catch(() => "");
+    const entry = content
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as Record<string, unknown>)
+      .find((candidate) => candidate.method === method);
+    if (entry) return entry;
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`fake App Server did not receive ${method}`);
+}
+
 afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 });
@@ -224,10 +255,12 @@ describe("internal controlled Codex execution", () => {
     const allocation = await harness.service.startTask({
       project_id: project.id,
       prompt: originalPrompt,
+      request_id: "private-request-id-for-name-test",
     });
     const record = await waitForTerminal(harness.runtime, allocation.task_id);
     expect(record.state).toBe("completed");
     expect(record.private_thread_id).toMatch(/^fake-thread-/);
+    const internalThreadId = record.private_thread_id!;
     expect(record.turns[0]?.git_baseline).toMatchObject({
       staged: 0,
       modified: 0,
@@ -241,6 +274,7 @@ describe("internal controlled Codex execution", () => {
     );
     const view = await harness.runtime.manager.getTaskView(allocation.task_id);
     expect(view).not.toHaveProperty("private_thread_id");
+    await waitForExecutionIdle(harness.service);
 
     const trace = await readFile(harness.tracePath, "utf8");
     const entries = trace
@@ -254,6 +288,44 @@ describe("internal controlled Codex execution", () => {
     const threadSecurity = entries.find(
       (entry) => entry.kind === "thread-security-check",
     );
+    const naming = entries.find((entry) => entry.method === "thread/name/set");
+    const unsubscribe = entries.find(
+      (entry) => entry.method === "thread/unsubscribe",
+    );
+    expect(naming?.params).toEqual({
+      threadId: internalThreadId,
+      name: `Context Bridge · ${project.name} · ${allocation.task_id.slice(0, 8)}`,
+    });
+    expect(entries.indexOf(naming!)).toBeLessThan(
+      entries.indexOf(unsubscribe!),
+    );
+    const matchingClosed = entries.find(
+      (entry) =>
+        entry.kind === "thread-closed-sent" &&
+        entry.threadId === internalThreadId,
+    );
+    const terminalNotification = entries.find(
+      (entry) =>
+        entry.kind === "turn-terminal-sent" &&
+        entry.threadId === internalThreadId,
+    );
+    expect(Number(terminalNotification?.at)).toBeLessThanOrEqual(
+      Number(naming?.at),
+    );
+    expect(Number(matchingClosed?.at)).toBeGreaterThanOrEqual(
+      Number(unsubscribe?.at),
+    );
+    expect(Number(matchingClosed?.at)).toBeLessThan(
+      Number(unsubscribe?.at) + 1_000,
+    );
+    expect(JSON.stringify(naming?.params)).not.toContain(originalPrompt);
+    expect(JSON.stringify(naming?.params)).not.toContain(project.root);
+    const generatedName =
+      (naming?.params as { name?: string } | undefined)?.name ?? "";
+    expect(generatedName).not.toContain(internalThreadId);
+    expect(generatedName).not.toContain("private-request-id-for-name-test");
+    expect(generatedName).not.toContain("gpt-6-luna");
+    expect(generatedName).not.toContain("private_thread_id");
     const turnStartParams = turnStart?.params as {
       input?: Array<{ type?: string; text?: string }>;
     };
@@ -494,6 +566,8 @@ describe("internal controlled Codex execution", () => {
     const record = await getOnlyStoredTask(harness);
     expect(record.state).toBe("failed");
     expect(record.private_thread_id).toMatch(/^fake-thread-/);
+    expect(await traceMethods(harness)).toContain("thread/unsubscribe");
+    expect(await traceMethods(harness)).not.toContain("thread/name/set");
     await expectWriterReleased(harness, project);
     const beforeRetry = await traceMethods(harness);
     expect(
@@ -709,6 +783,161 @@ describe("internal controlled Codex execution", () => {
       expect(record.state).toBe(expectedState);
       await waitForExecutionIdle(harness.service);
     }
+    const methods = await traceMethods(harness);
+    expect(
+      methods.filter((method) => method === "thread/unsubscribe"),
+    ).toHaveLength(2);
+  });
+
+  it("keeps active turns subscribed until confirmed terminal completion", async () => {
+    const harness = await createHarness("delayed-turn");
+    const project = await registerGitProject(
+      harness,
+      "active-subscription-project",
+    );
+    const allocation = await harness.service.startTask({
+      project_id: project.id,
+      prompt: "Remain active until cancellation is confirmed.",
+    });
+    expect(await traceMethods(harness)).not.toContain("thread/unsubscribe");
+    expect(await traceMethods(harness)).not.toContain("thread/name/set");
+    expect(harness.service.activeCount).toBe(1);
+
+    const result = await harness.service.cancelTask(allocation.task_id);
+    expect(result.state).toBe("cancelled");
+    expect(await traceMethods(harness)).toContain("thread/unsubscribe");
+    await expectWriterReleased(harness, project);
+  });
+
+  it("waits for the matching thread/closed notification and bounds a missing notification", async () => {
+    const unrelated = await createHarness("unrelated-thread-closed");
+    const unrelatedProject = await registerGitProject(
+      unrelated,
+      "unrelated-close-project",
+    );
+    const allocation = await unrelated.service.startTask({
+      project_id: unrelatedProject.id,
+      prompt: "Ignore unrelated closure notifications.",
+    });
+    await waitForTerminal(unrelated.runtime, allocation.task_id);
+    await waitForExecutionIdle(unrelated.service);
+    const unrelatedTrace = (await readFile(unrelated.tracePath, "utf8"))
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    const unrelatedUnsubscribe = unrelatedTrace.find(
+      (entry) => entry.method === "thread/unsubscribe",
+    );
+    const expectedClosed = unrelatedTrace.find(
+      (entry) =>
+        entry.kind === "thread-closed-sent" &&
+        entry.threadId !== "unrelated-thread",
+    );
+    const unrelatedSettledAt = Date.now();
+    expect(
+      Number(expectedClosed?.at) - Number(unrelatedUnsubscribe?.at),
+    ).toBeGreaterThanOrEqual(20);
+    expect(
+      unrelatedSettledAt - Number(unrelatedUnsubscribe?.at),
+    ).toBeGreaterThanOrEqual(20);
+    expect(unrelatedSettledAt - Number(unrelatedUnsubscribe?.at)).toBeLessThan(
+      1_000,
+    );
+
+    const missing = await createHarness("no-thread-closed");
+    const missingProject = await registerGitProject(
+      missing,
+      "missing-close-project",
+    );
+    const missingAllocation = await missing.service.startTask({
+      project_id: missingProject.id,
+      prompt: "Complete even if the cosmetic close event is absent.",
+    });
+    const record = await waitForTerminal(
+      missing.runtime,
+      missingAllocation.task_id,
+    );
+    await waitForExecutionIdle(missing.service);
+    expect(record.state).toBe("completed");
+    const missingTrace = (await readFile(missing.tracePath, "utf8"))
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    const missingUnsubscribe = missingTrace.find(
+      (entry) => entry.method === "thread/unsubscribe",
+    );
+    const elapsedFromUnsubscribe = Date.now() - Number(missingUnsubscribe?.at);
+    expect(elapsedFromUnsubscribe).toBeGreaterThanOrEqual(1_500);
+    expect(elapsedFromUnsubscribe).toBeLessThan(5_000);
+  });
+
+  it("keeps completed results successful when naming or unsubscribe fails", async () => {
+    for (const mode of ["thread-name-failure", "unsubscribe-failure"]) {
+      const harness = await createHarness(mode);
+      const project = await registerGitProject(harness, `${mode}-project`);
+      const allocation = await harness.service.startTask({
+        project_id: project.id,
+        prompt: "Complete successfully despite cosmetic cleanup failure.",
+        request_id: `${mode}-request-id`,
+      });
+      const record = await waitForTerminal(harness.runtime, allocation.task_id);
+      await waitForExecutionIdle(harness.service);
+      expect(record.state).toBe("completed");
+      expect(record.final_response?.text).toBe(
+        "Changed value.txt from alpha to beta.",
+      );
+      const json = JSON.stringify(
+        await harness.runtime.manager.getTaskView(allocation.task_id),
+      );
+      for (const privateValue of [
+        project.root,
+        record.private_thread_id ?? "",
+        `${mode}-request-id`,
+      ]) {
+        expect(json).not.toContain(privateValue);
+      }
+    }
+  });
+
+  it("persists the terminal result before naming and keeps the writer until release settles", async () => {
+    const harness = await createHarness("delayed-thread-name");
+    const project = await registerGitProject(
+      harness,
+      "terminal-name-order-project",
+    );
+    const allocation = await harness.service.startTask({
+      project_id: project.id,
+      prompt: "Persist terminal state before cleanup.",
+    });
+    const naming = await waitForTraceMethod(harness, "thread/name/set");
+    const record = await harness.runtime.manager.getTask(allocation.task_id);
+    expect(record.state).toBe("completed");
+    expect(record.final_response?.text).toBe(
+      "Changed value.txt from alpha to beta.",
+    );
+    expect(harness.service.activeCount).toBe(1);
+    expect(await tryAcquireProjectWriterLock(project.root)).toBeUndefined();
+    await waitForExecutionIdle(harness.service);
+    const methods = await traceMethods(harness);
+    expect(methods.indexOf("thread/name/set")).toBeLessThan(
+      methods.indexOf("thread/unsubscribe"),
+    );
+    expect(naming.method).toBe("thread/name/set");
+    await expectWriterReleased(harness, project);
+  });
+
+  it("sanitizes and bounds generated native-history names", () => {
+    const taskId = "12345678-1234-4234-8234-123456789abc";
+    const name = makeContextBridgeThreadName(
+      `unsafe/\u0001project\u202e${"x".repeat(200)}`,
+      taskId,
+    );
+    expect(name).toMatch(/^Context Bridge · unsafe project x+ · 12345678/);
+    expect(name).not.toContain("\u0001");
+    expect(name).not.toContain("\u202e");
+    expect(name).not.toContain("/");
+    expect(name).not.toContain(taskId);
+    expect(name.length).toBeLessThanOrEqual(90);
   });
 
   it("waits for confirmed interruption before cancellation and tolerates repeats", async () => {
@@ -809,5 +1038,6 @@ describe("internal controlled Codex execution", () => {
     const record = await waitForTerminal(harness.runtime, allocation.task_id);
     expect(record.state).toBe("interrupted");
     expect(record.turn_count).toBe(1);
+    expect(await traceMethods(harness)).not.toContain("thread/unsubscribe");
   });
 });

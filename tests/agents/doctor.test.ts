@@ -76,7 +76,7 @@ function fakeAdapter(
         provider: "codex",
         connected: true,
         experimentalApi: true,
-        version: "0.155.0-alpha.16.3",
+        version: "0.157.1",
       };
     },
     async checkAuthentication() {
@@ -155,9 +155,9 @@ describe.sequential("doctor App Server diagnostics", () => {
       await runCli(["doctor"], io, { createAgentAdapter: () => adapter }),
     ).toBe(0);
     const output = io.output.join("");
-    expect(output).toContain("Codex executable: found");
+    expect(output).toContain("Context Bridge Codex runtime: available");
     expect(output).toContain("App Server handshake: compatible");
-    expect(output).toContain("Codex version: 0.155.0-alpha.16.3");
+    expect(output).toContain("Codex version: 0.157.1");
     expect(output).toContain("Local Codex authentication: available");
     expect(output).toContain("Agent default profile luna-max: valid");
     expect(output).toContain("Enabled project profiles: 1 valid; 1 invalid");
@@ -167,19 +167,19 @@ describe.sequential("doctor App Server diagnostics", () => {
     expect(adapter.closed).toBe(true);
   });
 
-  it("reports a missing executable as a local diagnostic and closes the adapter", async () => {
+  it("reports an unavailable managed runtime as a local diagnostic and closes the adapter", async () => {
     const { root, projectRoot } = await setup();
     expect(await runCli(["project", "add", projectRoot], testIO(root))).toBe(0);
     await enableProjectAuthorization(await getProject("enabled-project"));
     const adapter = fakeAdapter({
-      startError: new AgentAdapterError("codex_not_found"),
+      startError: new AgentAdapterError("codex_runtime_unavailable"),
     });
     const io = testIO(root);
     expect(
       await runCli(["doctor"], io, { createAgentAdapter: () => adapter }),
     ).toBe(0);
     const output = io.output.join("");
-    expect(output).toContain("Codex executable: missing");
+    expect(output).toContain("Context Bridge Codex runtime: unavailable");
     expect(output).toContain("App Server handshake: not available");
     expect(output).toContain("Agent default profile: unavailable");
     expect(output).not.toContain("private path");

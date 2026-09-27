@@ -682,13 +682,13 @@ async function commandAgentDoctor(
       backend = await adapter.start();
     } catch (error) {
       const code = agentErrorCode(error);
-      if (code === "codex_not_found") {
-        io.stdout("Codex executable: missing\n");
+      if (code === "codex_runtime_unavailable") {
+        io.stdout("Context Bridge Codex runtime: unavailable\n");
         io.stdout("App Server handshake: not available\n");
       } else {
-        const executableStatus =
-          code === "app_server_start_failed" ? "could not start" : "found";
-        io.stdout(`Codex executable: ${executableStatus}\n`);
+        const runtimeStatus =
+          code === "app_server_start_failed" ? "could not start" : "available";
+        io.stdout(`Context Bridge Codex runtime: ${runtimeStatus}\n`);
         io.stdout(
           `App Server handshake: ${
             code === "app_server_incompatible" ||
@@ -705,7 +705,7 @@ async function commandAgentDoctor(
       return;
     }
 
-    io.stdout("Codex executable: found\n");
+    io.stdout("Context Bridge Codex runtime: available\n");
     io.stdout("App Server handshake: compatible\n");
     io.stdout(
       `Codex version: ${backend.version ?? "not reported by App Server"}\n`,

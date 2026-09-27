@@ -180,7 +180,7 @@ describe.sequential("agent M1 CLI", () => {
           provider: "codex",
           connected: true,
           experimentalApi: true,
-          version: "0.155.0-alpha.16.3",
+          version: "0.157.1",
         };
       },
       async checkAuthentication() {

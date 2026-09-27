@@ -11,7 +11,9 @@ const queuedRequests = [];
 let executionTurnStartCount = 0;
 
 if (mode === "version") {
-  process.stdout.write("codex-cli 0.155.0-alpha.16.3\n", () => process.exit(0));
+  process.stdout.write(`codex-cli ${process.argv[5] ?? "0.157.1"}\n`, () =>
+    process.exit(0),
+  );
 }
 
 function record(value) {
@@ -90,6 +92,7 @@ function processRequest(request) {
   if (typeof request?.method !== "string") return;
   record({
     method: request.method,
+    at: Date.now(),
     ...(request.params === undefined ? {} : { params: request.params }),
   });
 
@@ -151,16 +154,78 @@ function processRequest(request) {
     send({
       id: request.id,
       result: {
-        userAgent: "codex_cli_rs/0.155.0-alpha.16.3",
+        userAgent: "codex_cli_rs/0.157.1",
         platformFamily: "windows",
         platformOs: "windows",
-        serverInfo: { version: "0.155.0-alpha.16.3" },
+        serverInfo: { version: "0.157.1" },
       },
     });
     return;
   }
 
   if (request.method === "initialized") return;
+  if (request.method === "thread/name/set") {
+    if (mode === "thread-name-failure") {
+      send({
+        id: request.id,
+        error: { code: -32603, message: "PRIVATE_THREAD_NAME_ERROR" },
+      });
+      return;
+    }
+    const respond = () => send({ id: request.id, result: {} });
+    if (mode === "delayed-thread-name") setTimeout(respond, 100);
+    else respond();
+    return;
+  }
+  if (request.method === "thread/unsubscribe") {
+    if (mode === "unsubscribe-failure") {
+      send({
+        id: request.id,
+        error: { code: -32603, message: "PRIVATE_UNSUBSCRIBE_ERROR" },
+      });
+      return;
+    }
+    if (mode === "no-thread-closed") {
+      send({ id: request.id, result: {} });
+      return;
+    }
+    if (mode === "unrelated-thread-closed") {
+      record({
+        kind: "thread-closed-sent",
+        threadId: "unrelated-thread",
+        at: Date.now(),
+      });
+      send({
+        method: "thread/closed",
+        params: { threadId: "unrelated-thread" },
+      });
+      setTimeout(() => {
+        record({
+          kind: "thread-closed-sent",
+          threadId: request.params?.threadId,
+          at: Date.now(),
+        });
+        send({
+          method: "thread/closed",
+          params: { threadId: request.params?.threadId },
+        });
+      }, 30);
+      send({ id: request.id, result: {} });
+      return;
+    }
+    // Deliberately notify before the RPC response to exercise lost-wakeup safety.
+    record({
+      kind: "thread-closed-sent",
+      threadId: request.params?.threadId,
+      at: Date.now(),
+    });
+    send({
+      method: "thread/closed",
+      params: { threadId: request.params?.threadId },
+    });
+    send({ id: request.id, result: { accepted: true } });
+    return;
+  }
   if (request.method === "account/read") {
     if (mode === "exit-account") process.exit(18);
     if (mode === "timeout-account") return;
@@ -384,6 +449,12 @@ function processRequest(request) {
         },
       });
       if (mode !== "server-request" && mode !== "execution-server-request") {
+        record({
+          kind: "turn-terminal-sent",
+          threadId: params.threadId,
+          turnId: executionTurnId,
+          at: Date.now(),
+        });
         send({
           method: "turn/completed",
           params: {

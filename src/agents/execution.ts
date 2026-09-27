@@ -117,6 +117,36 @@ function executionPrompt(originalPrompt: string): string {
   ].join("\n");
 }
 
+export function makeContextBridgeThreadName(
+  projectName: string,
+  taskId: string,
+): string {
+  const safeProjectName = Array.from(
+    projectName
+      .normalize("NFKC")
+      .replace(/[\\/]/g, " ")
+      .replace(/[\p{Cc}\p{Cf}]/gu, " ")
+      .replace(/\s+/gu, " ")
+      .trim(),
+  )
+    .slice(0, 60)
+    .join("");
+  const shortTaskId = taskId.slice(0, 8);
+  return `Context Bridge · ${safeProjectName || "Project"} · ${shortTaskId}`;
+}
+
+function reportThreadCleanupIssue(
+  issue: "name" | "unsubscribe" | "closed",
+): void {
+  try {
+    process.stderr.write(
+      `Context Bridge: Codex thread ${issue} cleanup was incomplete.\n`,
+    );
+  } catch {
+    // Diagnostics must not affect a durably settled task.
+  }
+}
+
 async function captureGitBaseline(
   project: ProjectRecord,
 ): Promise<GitBaseline> {
@@ -248,7 +278,7 @@ export class AgentExecutionService {
           if (active.turnStartIssued && !knownRejection) {
             await this.handleSessionFailure();
           } else {
-            await this.finish(active, "failed");
+            await this.finish(active, "failed", knownRejection);
           }
           let record: TaskRecord;
           try {
@@ -633,17 +663,17 @@ export class AgentExecutionService {
                 active.finalText,
               );
             }
-            await this.finish(active, "completed");
+            await this.finish(active, "completed", true);
           } else if (
             event.status === "interrupted" &&
             active.cancelRequested &&
             !active.forceFailed
           ) {
-            await this.finish(active, "cancelled");
+            await this.finish(active, "cancelled", true);
           } else if (active.forceFailed || event.status === "failed") {
-            await this.finish(active, "failed");
+            await this.finish(active, "failed", true);
           } else {
-            await this.finish(active, "interrupted");
+            await this.finish(active, "interrupted", true);
           }
         }
       })
@@ -665,6 +695,7 @@ export class AgentExecutionService {
   private async finish(
     active: ActiveExecution,
     state: TaskState,
+    releaseThread = false,
   ): Promise<void> {
     if (
       active.settling ||
@@ -682,6 +713,29 @@ export class AgentExecutionService {
           active.allocation.turn_number,
           state,
         );
+      }
+      if (releaseThread && active.threadId) {
+        if (active.accepted && active.allocation.turn_number === 1) {
+          try {
+            await this.adapter.setThreadName({
+              threadId: active.threadId,
+              name: makeContextBridgeThreadName(
+                active.project.name,
+                active.allocation.task_id,
+              ),
+            });
+          } catch {
+            reportThreadCleanupIssue("name");
+          }
+        }
+        try {
+          const result = await this.adapter.releaseThread({
+            threadId: active.threadId,
+          });
+          if (!result.closedObserved) reportThreadCleanupIssue("closed");
+        } catch {
+          reportThreadCleanupIssue("unsubscribe");
+        }
       }
       if (active.interruptTimer) clearTimeout(active.interruptTimer);
       this.active.delete(active.allocation.task_id);

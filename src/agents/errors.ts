@@ -1,5 +1,5 @@
 export type AgentAdapterErrorCode =
-  | "codex_not_found"
+  | "codex_runtime_unavailable"
   | "codex_unauthenticated"
   | "app_server_start_failed"
   | "app_server_incompatible"
@@ -10,7 +10,7 @@ export type AgentAdapterErrorCode =
   | "effort_unsupported";
 
 const SAFE_MESSAGES: Record<AgentAdapterErrorCode, string> = {
-  codex_not_found: "The Codex executable was not found on PATH.",
+  codex_runtime_unavailable: "The Context Bridge Codex runtime is unavailable.",
   codex_unauthenticated: "No local Codex account is available.",
   app_server_start_failed: "The local Codex App Server could not be started.",
   app_server_incompatible:
@@ -57,7 +57,7 @@ export function safeAgentAdapterError(
     "code" in error &&
     error.code === "ENOENT"
   ) {
-    return new AgentAdapterError("codex_not_found");
+    return new AgentAdapterError("codex_runtime_unavailable");
   }
   return new AgentAdapterError(fallback);
 }

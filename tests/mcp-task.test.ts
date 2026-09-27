@@ -746,6 +746,22 @@ describe("M4B public task MCP façade", () => {
         retryable: false,
       });
 
+      const runtimeError = new AgentAdapterError("codex_runtime_unavailable");
+      runtimeError.message = "C:\\Users\\private\\managed-codex\\codex.exe";
+      host.startError = runtimeError;
+      const runtimeFailure = await client.callTool({
+        name: "task_start",
+        arguments: { project_id: "sample-project", prompt: "Start." },
+      });
+      expect(textError(runtimeFailure)).toEqual({
+        code: "codex_runtime_unavailable",
+        message: "The Context Bridge Codex runtime is unavailable.",
+        retryable: false,
+      });
+      expect(JSON.stringify(runtimeFailure)).not.toContain(
+        "C:\\Users\\private\\managed-codex",
+      );
+
       host.startError = new TaskError("request_id_conflict");
       const taskError = await client.callTool({
         name: "task_start",

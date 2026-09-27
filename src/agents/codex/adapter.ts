@@ -13,6 +13,7 @@ import { CodexAppServer, type AppServerOptions } from "./app-server.js";
 
 const MAX_MODEL_PAGES = 16;
 const MAX_MODELS = 512;
+const THREAD_CLOSED_WAIT_MS = 2_000;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -349,6 +350,55 @@ export class CodexAgentAdapter implements AgentExecutionAdapter {
       (!isRecord(result) || Object.keys(result).length > 0)
     ) {
       throw new AgentAdapterError("app_server_incompatible");
+    }
+  }
+
+  async setThreadName(input: {
+    threadId: string;
+    name: string;
+  }): Promise<void> {
+    await this.appServer.setThreadName(input);
+  }
+
+  async releaseThread(input: {
+    threadId: string;
+  }): Promise<{ closedObserved: boolean }> {
+    let resolveClosed!: () => void;
+    const closed = new Promise<void>((resolve) => {
+      resolveClosed = resolve;
+    });
+    let matched = false;
+    const unsubscribeListener = this.appServer.subscribe((event) => {
+      if (
+        event.type !== "notification" ||
+        event.value.method !== "thread/closed"
+      ) {
+        return;
+      }
+      const params = isRecord(event.value.params)
+        ? event.value.params
+        : undefined;
+      if (!matched && params?.threadId === input.threadId) {
+        matched = true;
+        resolveClosed();
+      }
+    });
+
+    let timeout: NodeJS.Timeout | undefined;
+    try {
+      await this.appServer.unsubscribeThread({
+        threadId: input.threadId,
+      });
+      const observed = await Promise.race([
+        closed.then(() => true),
+        new Promise<boolean>((resolve) => {
+          timeout = setTimeout(() => resolve(false), THREAD_CLOSED_WAIT_MS);
+        }),
+      ]);
+      return { closedObserved: observed };
+    } finally {
+      if (timeout) clearTimeout(timeout);
+      unsubscribeListener();
     }
   }
 
