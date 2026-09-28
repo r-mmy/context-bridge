@@ -117,6 +117,62 @@ export const TokenBreakdownSchema = z
 
 export type TokenBreakdown = z.infer<typeof TokenBreakdownSchema>;
 
+export const ACTIVITY_KINDS = [
+  "command_execution",
+  "file_change",
+  "mcp_tool_call",
+  "dynamic_tool_call",
+  "other",
+] as const;
+
+export type ActivityKind = (typeof ACTIVITY_KINDS)[number];
+
+const ActivityAggregateSchema = z
+  .object({
+    started_count: CountSchema,
+    completed_count: CountSchema,
+    failed_count: CountSchema,
+    duration_sample_count: CountSchema,
+    duration_total_ms: NullableCountSchema,
+  })
+  .strict();
+
+export type ActivityAggregate = z.infer<typeof ActivityAggregateSchema>;
+
+function emptyActivityAggregate(): ActivityAggregate {
+  return {
+    started_count: 0,
+    completed_count: 0,
+    failed_count: 0,
+    duration_sample_count: 0,
+    duration_total_ms: null,
+  };
+}
+
+export function emptyActivitySummary(): Record<
+  ActivityKind,
+  ActivityAggregate
+> {
+  return {
+    command_execution: emptyActivityAggregate(),
+    file_change: emptyActivityAggregate(),
+    mcp_tool_call: emptyActivityAggregate(),
+    dynamic_tool_call: emptyActivityAggregate(),
+    other: emptyActivityAggregate(),
+  };
+}
+
+const ActivitySummarySchema = z
+  .object({
+    command_execution: ActivityAggregateSchema,
+    file_change: ActivityAggregateSchema,
+    mcp_tool_call: ActivityAggregateSchema,
+    dynamic_tool_call: ActivityAggregateSchema,
+    other: ActivityAggregateSchema,
+  })
+  .strict()
+  .default(emptyActivitySummary());
+
 const UsageQualitySchema = z.enum([
   "authoritative_delta",
   "degraded",
@@ -271,6 +327,7 @@ export const TurnRecordSchema = z
     final_response: FinalResponseSchema.nullable(),
     safe_error: SafeErrorSchema.nullable(),
     usage: TurnUsageSchema,
+    activity_summary: ActivitySummarySchema,
   })
   .strict();
 
@@ -532,6 +589,17 @@ export function emptyTokenBreakdown(): TokenBreakdown {
     output_tokens: null,
     reasoning_output_tokens: null,
     total_tokens: null,
+  };
+}
+
+export function zeroTokenBreakdown(): TokenBreakdown {
+  return {
+    input_tokens: 0,
+    cached_input_tokens: 0,
+    cache_write_input_tokens: 0,
+    output_tokens: 0,
+    reasoning_output_tokens: 0,
+    total_tokens: 0,
   };
 }
 

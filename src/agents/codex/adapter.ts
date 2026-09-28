@@ -10,12 +10,21 @@ import type {
 import { validateProfileCapabilities } from "../adapter.js";
 import { AgentAdapterError } from "../errors.js";
 import type { AgentProfile } from "../profiles.js";
+import type { ActivityKind, TokenBreakdown } from "../../tasks/types.js";
 import { CodexAppServer, type AppServerOptions } from "./app-server.js";
 
 const MAX_MODEL_PAGES = 16;
 const MAX_MODELS = 512;
 const THREAD_CLOSED_WAIT_MS = 2_000;
 const REQUEST_USER_INPUT = "item/tool/requestUserInput";
+const TOKEN_FIELDS = [
+  ["inputTokens", "input_tokens"],
+  ["cachedInputTokens", "cached_input_tokens"],
+  ["cacheWriteInputTokens", "cache_write_input_tokens"],
+  ["outputTokens", "output_tokens"],
+  ["reasoningOutputTokens", "reasoning_output_tokens"],
+  ["totalTokens", "total_tokens"],
+] as const;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -34,6 +43,70 @@ function boundedText(value: unknown, maxLength: number): value is string {
     }
   }
   return true;
+}
+
+function parseTokenBreakdown(value: unknown): TokenBreakdown | undefined {
+  if (!isRecord(value)) return undefined;
+  const parsed: TokenBreakdown = {
+    input_tokens: null,
+    cached_input_tokens: null,
+    cache_write_input_tokens: null,
+    output_tokens: null,
+    reasoning_output_tokens: null,
+    total_tokens: null,
+  } satisfies TokenBreakdown;
+  for (const [protocolField, taskField] of TOKEN_FIELDS) {
+    const fieldValue = value[protocolField];
+    if (protocolField === "cacheWriteInputTokens" && fieldValue === undefined) {
+      parsed[taskField] = 0;
+      continue;
+    }
+    if (
+      typeof fieldValue !== "number" ||
+      !Number.isSafeInteger(fieldValue) ||
+      fieldValue < 0
+    ) {
+      return undefined;
+    }
+    parsed[taskField] = fieldValue;
+  }
+  return parsed;
+}
+
+function parseTokenUsage(params: Record<string, unknown>):
+  | {
+      total: TokenBreakdown;
+      last: TokenBreakdown;
+      modelContextWindow?: number | null;
+    }
+  | undefined {
+  if (!isRecord(params.tokenUsage)) return undefined;
+  const total = parseTokenBreakdown(params.tokenUsage.total);
+  const last = parseTokenBreakdown(params.tokenUsage.last);
+  if (!total || !last) return undefined;
+  const modelContextWindow = params.tokenUsage.modelContextWindow;
+  if (modelContextWindow === undefined) return { total, last };
+  if (
+    modelContextWindow !== null &&
+    (typeof modelContextWindow !== "number" ||
+      !Number.isSafeInteger(modelContextWindow) ||
+      modelContextWindow <= 0)
+  ) {
+    return undefined;
+  }
+  return { total, last, modelContextWindow };
+}
+
+function activityKind(value: unknown): ActivityKind | undefined {
+  if (value === "commandExecution") return "command_execution";
+  if (value === "fileChange") return "file_change";
+  if (value === "mcpToolCall") return "mcp_tool_call";
+  if (value === "dynamicToolCall") return "dynamic_tool_call";
+  return typeof value === "string" && value.length > 0 ? "other" : undefined;
+}
+
+function isProtocolTimestamp(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
 function parseUserInputQuestions(value: unknown) {
@@ -275,6 +348,19 @@ export class CodexAgentAdapter implements AgentExecutionAdapter {
         return;
       }
       const { method, params } = event.value;
+      if (method === "thread/tokenUsage/updated") {
+        if (!isRecord(params)) return;
+        const threadId = boundedIdentifier(params.threadId);
+        const turnId = boundedIdentifier(params.turnId);
+        if (!threadId || !turnId) return;
+        const usage = parseTokenUsage(params);
+        if (!usage) {
+          listener({ type: "usage_invalid", threadId, turnId });
+          return;
+        }
+        listener({ type: "usage_updated", threadId, turnId, ...usage });
+        return;
+      }
       if (!isRecord(params)) {
         if (
           method === "turn/started" ||
@@ -293,6 +379,28 @@ export class CodexAgentAdapter implements AgentExecutionAdapter {
           method === "item/completed"
         ) {
           listener({ type: "session_failed" });
+        }
+        return;
+      }
+      if (method === "item/started") {
+        const turnId = boundedIdentifier(params.turnId);
+        const item = isRecord(params.item) ? params.item : undefined;
+        const itemId = boundedIdentifier(item?.id);
+        const kind = activityKind(item?.type);
+        if (
+          turnId &&
+          itemId &&
+          kind &&
+          isProtocolTimestamp(params.startedAtMs)
+        ) {
+          listener({
+            type: "activity_started",
+            threadId,
+            turnId,
+            itemId,
+            activityKind: kind,
+            startedAtMs: params.startedAtMs,
+          });
         }
         return;
       }
@@ -325,6 +433,22 @@ export class CodexAgentAdapter implements AgentExecutionAdapter {
         if (!turnId) {
           listener({ type: "session_failed" });
           return;
+        }
+        const itemId = boundedIdentifier(item.id);
+        const kind = activityKind(item.type);
+        if (itemId && kind && isProtocolTimestamp(params.completedAtMs)) {
+          listener({
+            type: "activity_completed",
+            threadId,
+            turnId,
+            itemId,
+            activityKind: kind,
+            completedAtMs: params.completedAtMs,
+            failed:
+              item.status === "failed" ||
+              item.status === "declined" ||
+              item.status === "interrupted",
+          });
         }
         if (
           item.type === "agentMessage" &&

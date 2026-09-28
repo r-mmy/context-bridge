@@ -18,6 +18,7 @@ import { readTextFile } from "../src/filesystem/read.js";
 import { getGitStatus } from "../src/git/service.js";
 import { TaskRuntime } from "../src/tasks/runtime.js";
 import { TaskStore } from "../src/tasks/store.js";
+import { zeroTokenBreakdown } from "../src/tasks/types.js";
 import { git } from "./helpers.js";
 
 interface ChildEvent {
@@ -242,7 +243,25 @@ describe.sequential("task runtime ownership and recovery", () => {
 
     const queued = await makeTask("queued");
     const running = await makeTask("running");
+    await manager.setTurnUsageStartTotal(
+      running.task_id,
+      1,
+      zeroTokenBreakdown(),
+    );
     await manager.transitionTurn(running.task_id, 1, "running");
+    const preservedTotal = {
+      input_tokens: 12,
+      cached_input_tokens: 2,
+      cache_write_input_tokens: 1,
+      output_tokens: 5,
+      reasoning_output_tokens: 3,
+      total_tokens: 17,
+    };
+    await manager.recordThreadUsage(running.task_id, 1, {
+      total: preservedTotal,
+      last: preservedTotal,
+      model_context_window: 258_400,
+    });
     await manager.setPrivateThreadId(
       running.task_id,
       "private-thread-recovery",
@@ -276,8 +295,27 @@ describe.sequential("task runtime ownership and recovery", () => {
       "interrupted",
     ] as const) {
       const allocation = await makeTask(`terminal-${state}`);
+      if (state === "completed") {
+        await manager.setTurnUsageStartTotal(
+          allocation.task_id,
+          1,
+          zeroTokenBreakdown(),
+        );
+      }
       await manager.transitionTurn(allocation.task_id, 1, "running");
-      await manager.transitionTurn(allocation.task_id, 1, state);
+      if (state === "completed") {
+        await manager.recordThreadUsage(allocation.task_id, 1, {
+          total: preservedTotal,
+          last: preservedTotal,
+          model_context_window: 258_400,
+        });
+      }
+      await manager.transitionTurn(
+        allocation.task_id,
+        1,
+        state,
+        state === "completed",
+      );
       terminal.push({ taskId: allocation.task_id, state });
     }
     const localOnly = await makeTask("secret-local-action");
@@ -316,6 +354,15 @@ describe.sequential("task runtime ownership and recovery", () => {
     const preservedThread = await restarted.manager.getTask(running.task_id);
     expect(preservedThread.private_thread_id).toBe("private-thread-recovery");
     expect(preservedThread.idempotency[0]?.request_id_hash).toBeDefined();
+    expect(preservedThread.usage_summary.thread_total).toEqual(preservedTotal);
+    expect(preservedThread.turns[0]?.usage).toMatchObject({
+      start_total: zeroTokenBreakdown(),
+      end_total: null,
+      latest_last: preservedTotal,
+      turn_delta: null,
+      delta_quality: "degraded",
+    });
+    expect(preservedThread.usage_summary.delta_quality).toBe("degraded");
     for (const item of terminal) {
       const record = await restarted.manager.getTask(item.taskId);
       expect(record.state).toBe(item.state);
@@ -325,6 +372,12 @@ describe.sequential("task runtime ownership and recovery", () => {
       expect(
         record.events.filter((event) => event.kind === "recovered"),
       ).toHaveLength(0);
+      expect(record.turns[0]?.usage).toEqual(
+        before.get(item.taskId)?.turns[0]?.usage,
+      );
+      expect(record.usage_summary).toEqual(
+        before.get(item.taskId)?.usage_summary,
+      );
     }
 
     await restarted.close();

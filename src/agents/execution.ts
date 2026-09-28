@@ -24,11 +24,19 @@ import type {
   CreateTaskIntentInput,
 } from "../tasks/manager.js";
 import type { TaskRuntime } from "../tasks/runtime.js";
-import type { GitBaseline, TaskRecord, TaskState } from "../tasks/types.js";
+import {
+  zeroTokenBreakdown,
+  type ActivityKind,
+  type GitBaseline,
+  type TaskRecord,
+  type TaskState,
+} from "../tasks/types.js";
 import type { PendingInput } from "../tasks/types.js";
 
 export const MAX_ACTIVE_AGENT_TURNS = 4;
 const INTERRUPT_TIMEOUT_MS = 15_000;
+const MAX_PENDING_ACTIVITY_STARTS = 256;
+const MAX_ACTIVITY_DURATION_MS = 24 * 60 * 60 * 1_000;
 const START_INPUT_SCHEMA = z
   .object({
     project_id: z
@@ -115,6 +123,10 @@ interface ActiveExecution {
   turnStartIssued: boolean;
   accepted: boolean;
   earlyEvents: AgentExecutionEvent[];
+  activityStarts: Map<
+    string,
+    { activityKind: ActivityKind; startedAtMs: number }
+  >;
   observedTerminal?: "completed" | "interrupted" | "failed";
   finalText?: string;
   cancelRequested: boolean;
@@ -915,6 +927,7 @@ export class AgentExecutionService {
       turnStartIssued: false,
       accepted: false,
       earlyEvents: [],
+      activityStarts: new Map(),
       cancelRequested: false,
       forceFailed: false,
       pendingInputQueued: false,
@@ -1009,6 +1022,12 @@ export class AgentExecutionService {
       thread.threadId,
     );
     if (!this.isActive(active)) return;
+    await this.runtime.manager.setTurnUsageStartTotal(
+      active.allocation.task_id,
+      active.allocation.turn_number,
+      zeroTokenBreakdown(),
+    );
+    if (!this.isActive(active)) return;
 
     active.turnStartIssued = true;
     const turn = await this.adapter.startTurn({
@@ -1058,6 +1077,20 @@ export class AgentExecutionService {
     );
     if (!this.isActive(active)) return;
 
+    const stored = await this.runtime.manager.getTask(
+      active.allocation.task_id,
+    );
+    const priorTotal = stored.usage_summary.thread_total;
+    const startTotal = Object.values(priorTotal).some((value) => value !== null)
+      ? priorTotal
+      : null;
+    await this.runtime.manager.setTurnUsageStartTotal(
+      active.allocation.task_id,
+      active.allocation.turn_number,
+      startTotal,
+    );
+    if (!this.isActive(active)) return;
+
     const turn = await this.issueTurnStart(active, storedThreadId);
     await this.acceptStartedTurn(active, storedThreadId, turn);
   }
@@ -1079,11 +1112,11 @@ export class AgentExecutionService {
     threadId: string,
     turn: Awaited<ReturnType<AgentExecutionAdapter["startTurn"]>>,
   ): Promise<void> {
-    active.turnId = turn.turnId;
     active.accepted = true;
     if (this.active.get(active.allocation.task_id) !== active) return;
     if (this.sessionFailure) return;
     if (this.closed) {
+      active.turnId = turn.turnId;
       await this.requestInterrupt(active);
       return;
     }
@@ -1099,9 +1132,18 @@ export class AgentExecutionService {
       active.allocation.turn_number,
       "running",
     );
+    // Keep notifications arriving while the running state is persisted in the
+    // early queue. Assigning turnId before this await lets newer events bypass
+    // older buffered notifications and can move them past terminal settlement.
+    active.turnId = turn.turnId;
     const earlyEvents = active.earlyEvents;
     active.earlyEvents = [];
-    for (const event of earlyEvents) this.enqueueEvent(active, event);
+    for (const event of earlyEvents) {
+      if ("turnId" in event && event.turnId !== turn.turnId) {
+        continue;
+      }
+      this.enqueueEvent(active, event);
+    }
     if (turn.status !== "inProgress") {
       this.enqueueEvent(active, {
         type: "turn_completed",
@@ -1197,6 +1239,22 @@ export class AgentExecutionService {
       this.enqueueEvent(active, queued);
       return;
     }
+    if (
+      event.type === "usage_updated" ||
+      event.type === "usage_invalid" ||
+      event.type === "activity_started" ||
+      event.type === "activity_completed"
+    ) {
+      const active = this.byThread.get(event.threadId);
+      if (!active) return;
+      if (!active.turnId) {
+        active.earlyEvents.push(event);
+        return;
+      }
+      if (active.turnId !== event.turnId) return;
+      this.enqueueEvent(active, event);
+      return;
+    }
     const active = this.byThread.get(event.threadId);
     if (!active) return;
     if (!active.turnId) {
@@ -1242,6 +1300,67 @@ export class AgentExecutionService {
         }
         if (event.type === "user_input_requested") {
           await this.handleUserInputRequest(active, event);
+          return;
+        }
+        if (event.type === "usage_updated") {
+          await this.runtime.manager.recordThreadUsage(
+            active.allocation.task_id,
+            active.allocation.turn_number,
+            {
+              total: event.total,
+              last: event.last,
+              ...(event.modelContextWindow === undefined
+                ? {}
+                : { model_context_window: event.modelContextWindow }),
+            },
+          );
+          return;
+        }
+        if (event.type === "usage_invalid") {
+          await this.runtime.manager.markTurnUsageDegraded(
+            active.allocation.task_id,
+            active.allocation.turn_number,
+          );
+          return;
+        }
+        if (event.type === "activity_started") {
+          const key = `${event.activityKind}\0${event.itemId}`;
+          if (active.activityStarts.has(key)) return;
+          await this.runtime.manager.recordActivityStarted(
+            active.allocation.task_id,
+            active.allocation.turn_number,
+            event.activityKind,
+          );
+          if (active.activityStarts.size < MAX_PENDING_ACTIVITY_STARTS) {
+            active.activityStarts.set(key, {
+              activityKind: event.activityKind,
+              startedAtMs: event.startedAtMs,
+            });
+          }
+          return;
+        }
+        if (event.type === "activity_completed") {
+          const key = `${event.activityKind}\0${event.itemId}`;
+          const started = active.activityStarts.get(key);
+          active.activityStarts.delete(key);
+          const elapsed =
+            started && started.activityKind === event.activityKind
+              ? event.completedAtMs - started.startedAtMs
+              : undefined;
+          const durationMs =
+            elapsed !== undefined &&
+            Number.isSafeInteger(elapsed) &&
+            elapsed >= 0 &&
+            elapsed <= MAX_ACTIVITY_DURATION_MS
+              ? elapsed
+              : null;
+          await this.runtime.manager.recordActivityCompleted(
+            active.allocation.task_id,
+            active.allocation.turn_number,
+            event.activityKind,
+            event.failed,
+            durationMs,
+          );
           return;
         }
         if (event.type === "turn_completed") {
@@ -1392,12 +1511,14 @@ export class AgentExecutionService {
           await this.runtime.manager.requireLocalAction(
             active.allocation.task_id,
             active.allocation.turn_number,
+            active.observedTerminal !== undefined,
           );
         } else {
           await this.runtime.manager.transitionTurn(
             active.allocation.task_id,
             active.allocation.turn_number,
             state,
+            active.observedTerminal !== undefined,
           );
         }
       }
@@ -1425,6 +1546,7 @@ export class AgentExecutionService {
         }
       }
       if (active.interruptTimer) clearTimeout(active.interruptTimer);
+      active.activityStarts.clear();
       this.active.delete(active.allocation.task_id);
       if (active.threadId) this.byThread.delete(active.threadId);
       await active.writerLock.release();

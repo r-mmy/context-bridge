@@ -7,6 +7,7 @@ import { AgentAdapterError } from "../src/agents/errors.js";
 import { ContextBridgeError } from "../src/security/errors.js";
 import { TaskError } from "../src/tasks/errors.js";
 import {
+  emptyActivitySummary,
   emptyTaskUsageSummary,
   emptyTurnUsage,
   TaskRecordSchema,
@@ -94,6 +95,7 @@ function makeRecord(
             ? { code: "task_interrupted" as const }
             : null,
     usage: emptyTurnUsage(),
+    activity_summary: emptyActivitySummary(),
   };
   const events = options.events ?? [
     makeEvent(1, "lifecycle", "created", "queued", null),
@@ -796,6 +798,39 @@ describe("public task MCP façade", () => {
         "updated_at",
       ]);
 
+      const total = {
+        input_tokens: 120,
+        cached_input_tokens: 30,
+        cache_write_input_tokens: 8,
+        output_tokens: 40,
+        reasoning_output_tokens: 10,
+        total_tokens: 160,
+      };
+      const last = {
+        input_tokens: 20,
+        cached_input_tokens: 5,
+        cache_write_input_tokens: 2,
+        output_tokens: 8,
+        reasoning_output_tokens: 3,
+        total_tokens: 28,
+      };
+      host.record.usage_summary = {
+        thread_total: total,
+        latest_last: last,
+        model_context_window: 258_400,
+        delta_quality: "authoritative_delta",
+        model_request_count: null,
+      };
+      host.record.turns[0]!.usage = {
+        start_total: emptyTurnUsage().start_total,
+        end_total: total,
+        latest_last: last,
+        turn_delta: total,
+        model_context_window: 258_400,
+        delta_quality: "authoritative_delta",
+        model_request_count: null,
+      };
+
       const got = await client.callTool({
         name: "task_get",
         arguments: {
@@ -818,6 +853,7 @@ describe("public task MCP façade", () => {
       expect(getOutput.final_response).toBeNull();
       expect(getOutput.final_response_included).toBe(false);
       expect(getOutput.truncation.final_response).toBe(false);
+      expect(getOutput).not.toHaveProperty("activity_summary");
       expect(getOutput.current_turn).toMatchObject({
         profile: "luna-max",
         mode: "default",
@@ -828,14 +864,32 @@ describe("public task MCP façade", () => {
           untracked_count: 4,
         },
         usage: {
+          thread_total: total,
+          latest_last: last,
+          turn_delta: total,
+          model_context_window: 258_400,
           model_request_count: null,
-          delta_quality: "unavailable",
+          delta_quality: "authoritative_delta",
         },
       });
       expect(getOutput.usage).toMatchObject({
-        turn_delta: null,
+        thread_total: total,
+        latest_last: last,
+        model_context_window: 258_400,
+        delta_quality: "authoritative_delta",
         model_request_count: null,
       });
+      expect(getOutput.current_turn?.usage).toMatchObject({
+        thread_total: total,
+        latest_last: last,
+        turn_delta: total,
+        model_context_window: 258_400,
+        delta_quality: "authoritative_delta",
+        model_request_count: null,
+      });
+      expect(getOutput.current_turn?.usage).not.toHaveProperty("start_total");
+      expect(getOutput.current_turn?.usage).not.toHaveProperty("end_total");
+      expect(getOutput.current_turn).not.toHaveProperty("activity_summary");
 
       const allEvents = await client.callTool({
         name: "task_get",

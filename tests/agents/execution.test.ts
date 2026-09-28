@@ -557,6 +557,352 @@ describe("internal controlled Codex execution", () => {
     await expectWriterReleased(harness, project);
   });
 
+  it("persists pinned-protocol usage deltas and private activity aggregates across same-thread turns", async () => {
+    const harness = await createHarness("m6-telemetry");
+    const project = await registerGitProject(harness, "telemetry-project");
+    const started = await harness.service.startTask({
+      project_id: project.id,
+      prompt: "Summarize the existing workspace without changing any files.",
+    });
+    const first = await waitForTerminal(harness.runtime, started.task_id);
+    await waitForExecutionIdle(harness.service);
+    const firstTurn = first.turns[0];
+    expect(firstTurn?.usage).toEqual({
+      start_total: {
+        input_tokens: 0,
+        cached_input_tokens: 0,
+        cache_write_input_tokens: 0,
+        output_tokens: 0,
+        reasoning_output_tokens: 0,
+        total_tokens: 0,
+      },
+      end_total: {
+        input_tokens: 100,
+        cached_input_tokens: 10,
+        cache_write_input_tokens: 4,
+        output_tokens: 20,
+        reasoning_output_tokens: 10,
+        total_tokens: 120,
+      },
+      latest_last: {
+        input_tokens: 60,
+        cached_input_tokens: 8,
+        cache_write_input_tokens: 2,
+        output_tokens: 10,
+        reasoning_output_tokens: 6,
+        total_tokens: 70,
+      },
+      turn_delta: {
+        input_tokens: 100,
+        cached_input_tokens: 10,
+        cache_write_input_tokens: 4,
+        output_tokens: 20,
+        reasoning_output_tokens: 10,
+        total_tokens: 120,
+      },
+      model_context_window: 258_400,
+      delta_quality: "authoritative_delta",
+      model_request_count: null,
+    });
+    expect(firstTurn?.activity_summary).toMatchObject({
+      command_execution: {
+        started_count: 1,
+        completed_count: 1,
+        failed_count: 0,
+        duration_sample_count: 1,
+        duration_total_ms: 25,
+      },
+      file_change: {
+        started_count: 1,
+        completed_count: 1,
+        failed_count: 0,
+        duration_sample_count: 1,
+        duration_total_ms: 25,
+      },
+      mcp_tool_call: {
+        started_count: 1,
+        completed_count: 1,
+        failed_count: 1,
+        duration_sample_count: 1,
+        duration_total_ms: 25,
+      },
+      dynamic_tool_call: {
+        started_count: 1,
+        completed_count: 1,
+        failed_count: 0,
+        duration_sample_count: 1,
+        duration_total_ms: 25,
+      },
+      other: {
+        started_count: 1,
+        completed_count: 1,
+        failed_count: 0,
+        duration_sample_count: 1,
+        duration_total_ms: 25,
+      },
+    });
+    expect(first.usage_summary.thread_total).toEqual(
+      firstTurn?.usage.end_total,
+    );
+    expect(first.usage_summary.latest_last).toEqual(
+      firstTurn?.usage.latest_last,
+    );
+
+    const secondAllocation = await harness.service.continueTask({
+      task_id: started.task_id,
+      prompt: "Continue the harmless summary without changing files.",
+    });
+    const second = await waitForTerminal(harness.runtime, started.task_id);
+    await waitForExecutionIdle(harness.service);
+    expect(secondAllocation.turn_number).toBe(2);
+    expect(second.private_thread_id).toBe(first.private_thread_id);
+    expect(second.turns[1]?.usage).toMatchObject({
+      start_total: firstTurn?.usage.end_total,
+      end_total: {
+        input_tokens: 200,
+        cached_input_tokens: 25,
+        cache_write_input_tokens: 6,
+        output_tokens: 40,
+        reasoning_output_tokens: 18,
+        total_tokens: 240,
+      },
+      turn_delta: {
+        input_tokens: 100,
+        cached_input_tokens: 15,
+        cache_write_input_tokens: 2,
+        output_tokens: 20,
+        reasoning_output_tokens: 8,
+        total_tokens: 120,
+      },
+      model_context_window: 262_144,
+      delta_quality: "authoritative_delta",
+      model_request_count: null,
+    });
+    expect(second.usage_summary.thread_total).toEqual(
+      second.turns[1]?.usage.end_total,
+    );
+    expect(second.usage_summary.latest_last).toEqual(
+      second.turns[1]?.usage.latest_last,
+    );
+    expect(second.usage_summary.model_context_window).toBe(262_144);
+
+    const persisted = await readFile(getTaskPath(started.task_id), "utf8");
+    for (const secret of [
+      "PRIVATE_COMMAND_SENTINEL",
+      "PRIVATE_TOOL_ARGUMENT_SENTINEL",
+      "PRIVATE_TOOL_OUTPUT_SENTINEL",
+      "PRIVATE_USAGE_PAYLOAD_SENTINEL",
+      "PRIVATE_UNKNOWN_FIELD_SENTINEL",
+      "C:\\private\\project\\root",
+      "private-command-activity-id",
+      "private-file-activity-id",
+      "private-mcp-activity-id",
+      "private-dynamic-activity-id",
+      "private-other-activity-id",
+    ]) {
+      expect(persisted).not.toContain(secret);
+    }
+  });
+
+  it("routes usage only to the matching active thread and turn", async () => {
+    const harness = await createHarness("m6-routing");
+    const project = await registerGitProject(harness, "telemetry-routing");
+    const allocation = await harness.service.startTask({
+      project_id: project.id,
+      prompt: "Summarize without changing files.",
+    });
+    await waitForTerminal(harness.runtime, allocation.task_id);
+    await waitForExecutionIdle(harness.service);
+
+    const record = await harness.runtime.manager.getTask(allocation.task_id);
+    expect(record.usage_summary.thread_total).toEqual({
+      input_tokens: 100,
+      cached_input_tokens: 10,
+      cache_write_input_tokens: 4,
+      output_tokens: 20,
+      reasoning_output_tokens: 10,
+      total_tokens: 120,
+    });
+    const persisted = await readFile(getTaskPath(allocation.task_id), "utf8");
+    expect(persisted).not.toContain("stale-private-turn-id");
+    expect(persisted).not.toContain("unrelated-private-thread-id");
+    expect(persisted).not.toContain('"total_tokens":999');
+  });
+
+  it("does not add repeated identical cumulative or last snapshots", async () => {
+    const harness = await createHarness("m6-repeated-last");
+    const project = await registerGitProject(harness, "telemetry-repeated");
+    const allocation = await harness.service.startTask({
+      project_id: project.id,
+      prompt: "Summarize without changing files.",
+    });
+    await waitForTerminal(harness.runtime, allocation.task_id);
+    await waitForExecutionIdle(harness.service);
+
+    const record = await harness.runtime.manager.getTask(allocation.task_id);
+    expect(record.turns[0]?.usage.turn_delta?.total_tokens).toBe(120);
+    expect(record.turns[0]?.usage.latest_last?.total_tokens).toBe(70);
+    expect(record.usage_summary.thread_total.total_tokens).toBe(120);
+    expect(record.usage_summary.model_request_count).toBeNull();
+  });
+
+  it("keeps user-input waiting separate while telemetry continues on the same turn", async () => {
+    const harness = await createHarness("m6-input-telemetry");
+    const project = await registerGitProject(harness, "telemetry-input");
+    const allocation = await harness.service.startTask({
+      project_id: project.id,
+      prompt: "Ask one harmless question, then finish without edits.",
+    });
+    const waiting = await waitForPendingInput(
+      harness.runtime,
+      allocation.task_id,
+    );
+    await harness.service.answerUserInput({
+      task_id: allocation.task_id,
+      pending_input_id: waiting.pending_input!.pending_input_id,
+      answers: [
+        { question_id: "choice", answers: ["Proceed"] },
+        { question_id: "note", answers: ["answered for the test"] },
+        { question_id: "choice-with-note", answers: ["Proceed"] },
+        {
+          question_id: "__proto__",
+          answers: ["opaque identifier accepted"],
+        },
+      ],
+    });
+    await waitForTerminal(harness.runtime, allocation.task_id);
+    await waitForExecutionIdle(harness.service);
+
+    const record = await harness.runtime.manager.getTask(allocation.task_id);
+    expect(record.turn_count).toBe(1);
+    expect(record.turns[0]).toMatchObject({
+      input_wait_count: 1,
+      usage: {
+        turn_delta: {
+          input_tokens: 100,
+          cached_input_tokens: 10,
+          cache_write_input_tokens: 4,
+          output_tokens: 20,
+          reasoning_output_tokens: 10,
+          total_tokens: 120,
+        },
+      },
+    });
+    expect(record.turns[0]?.activity_summary).not.toHaveProperty(
+      "request_user_input",
+    );
+  });
+
+  it("ignores usage notifications received after terminal settlement", async () => {
+    const harness = await createHarness("m6-post-terminal-usage");
+    const project = await registerGitProject(
+      harness,
+      "telemetry-post-terminal",
+    );
+    const allocation = await harness.service.startTask({
+      project_id: project.id,
+      prompt: "Summarize without changing files.",
+    });
+    await waitForTerminal(harness.runtime, allocation.task_id);
+    await waitForExecutionIdle(harness.service);
+    const before = await harness.runtime.manager.getTask(allocation.task_id);
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    const trace = await readFile(harness.tracePath, "utf8");
+    expect(trace).toContain("m6-post-terminal-notification-sent");
+    const after = await harness.runtime.manager.getTask(allocation.task_id);
+    expect(after.usage_summary).toEqual(before.usage_summary);
+    expect(after.turns[0]?.usage).toEqual(before.turns[0]?.usage);
+  });
+
+  it("keeps concurrent telemetry bound to each task's private thread", async () => {
+    const harness = await createHarness("m6-concurrent-telemetry");
+    const firstProject = await registerGitProject(harness, "telemetry-first");
+    const secondProject = await registerGitProject(harness, "telemetry-second");
+    const [firstAllocation, secondAllocation] = await Promise.all([
+      harness.service.startTask({
+        project_id: firstProject.id,
+        prompt: "Summarize without changing files.",
+      }),
+      harness.service.startTask({
+        project_id: secondProject.id,
+        prompt: "Summarize without changing files.",
+      }),
+    ]);
+    await Promise.all([
+      waitForTerminal(harness.runtime, firstAllocation.task_id),
+      waitForTerminal(harness.runtime, secondAllocation.task_id),
+    ]);
+    await waitForExecutionIdle(harness.service);
+
+    const records = await Promise.all([
+      harness.runtime.manager.getTask(firstAllocation.task_id),
+      harness.runtime.manager.getTask(secondAllocation.task_id),
+    ]);
+    const totals = records.map((record) => record.usage_summary.thread_total);
+    expect(
+      totals
+        .map((total) => total.total_tokens)
+        .sort((a, b) => (a ?? -1) - (b ?? -1)),
+    ).toEqual([120, 240]);
+    expect(
+      records.every(
+        (record) =>
+          record.turns[0]?.usage.end_total?.total_tokens ===
+          record.usage_summary.thread_total.total_tokens,
+      ),
+    ).toBe(true);
+  });
+
+  it.each([
+    ["m6-malformed-usage", "degraded"],
+    ["m6-decreasing-usage", "degraded"],
+  ] as const)(
+    "completes safely with %s telemetry marked %s",
+    async (mode, expectedQuality) => {
+      const harness = await createHarness(mode);
+      const project = await registerGitProject(harness, `telemetry-${mode}`);
+      const allocation = await harness.service.startTask({
+        project_id: project.id,
+        prompt: "Summarize the workspace without modifying it.",
+      });
+      const record = await waitForTerminal(harness.runtime, allocation.task_id);
+      expect(record.state).toBe("completed");
+      expect(record.turns[0]?.usage.delta_quality).toBe(expectedQuality);
+      expect(record.turns[0]?.usage.turn_delta).toBeNull();
+      expect(record.turns[0]?.usage.end_total).not.toBeNull();
+      if (mode === "m6-decreasing-usage") {
+        expect(record.turns[0]?.usage.end_total).toEqual({
+          input_tokens: 50,
+          cached_input_tokens: 10,
+          cache_write_input_tokens: 3,
+          output_tokens: 20,
+          reasoning_output_tokens: 8,
+          total_tokens: 70,
+        });
+        expect(record.usage_summary.thread_total).toEqual(
+          record.turns[0]?.usage.end_total,
+        );
+      }
+      await waitForExecutionIdle(harness.service);
+
+      const persisted = await readFile(getTaskPath(allocation.task_id), "utf8");
+      expect(persisted).not.toContain("PRIVATE_USAGE_PAYLOAD_SENTINEL");
+    },
+  );
+
+  it("leaves usage unavailable and end_total unset when the protocol sends no snapshots", async () => {
+    const harness = await createHarness("normal");
+    const project = await registerGitProject(harness, "no-telemetry-project");
+    const allocation = await harness.service.startTask({
+      project_id: project.id,
+      prompt: "Summarize the workspace without modifying it.",
+    });
+    const record = await waitForTerminal(harness.runtime, allocation.task_id);
+    expect(record.turns[0]?.usage.end_total).toBeNull();
+    expect(record.turns[0]?.usage.turn_delta).toBeNull();
+    expect(record.turns[0]?.usage.delta_quality).toBe("unavailable");
+  });
+
   it.each([
     "resume-wrong-cwd",
     "resume-missing-cwd",

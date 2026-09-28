@@ -35,10 +35,17 @@ function recoveryRecord(record: TaskRecord, now: string): TaskRecord {
   turn.state = "interrupted";
   turn.completed_at = now;
   turn.safe_error = { code: "task_interrupted" };
+  turn.usage.end_total = null;
+  turn.usage.turn_delta = null;
+  turn.usage.delta_quality =
+    turn.usage.latest_last !== null || turn.usage.delta_quality === "degraded"
+      ? "degraded"
+      : "unavailable";
   recovered.state = "interrupted";
   recovered.updated_at = now;
   recovered.pending_input = null;
   recovered.safe_error = { code: "task_interrupted" };
+  recovered.usage_summary.delta_quality = turn.usage.delta_quality;
   appendTaskEventToRecord(
     recovered,
     {

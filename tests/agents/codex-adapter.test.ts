@@ -8,6 +8,7 @@ import type {
   SpawnOptions,
 } from "node:child_process";
 import { afterEach, describe, expect, it } from "vitest";
+import type { AgentExecutionEvent } from "../../src/agents/adapter.js";
 import type { AgentProfile } from "../../src/agents/profiles.js";
 import { AgentAdapterError } from "../../src/agents/errors.js";
 import { CodexAgentAdapter } from "../../src/agents/codex/adapter.js";
@@ -234,6 +235,90 @@ describe("Codex App Server adapter", () => {
         "utf8",
       ),
     ).resolves.toBe("fixture = true\n");
+  });
+
+  it("normalizes bounded token snapshots and rejects malformed protocol values", async () => {
+    const harness = await createHarness("m6-parser-cases");
+    const events: AgentExecutionEvent[] = [];
+    const unsubscribe = harness.adapter.subscribe((event) =>
+      events.push(event),
+    );
+    const root = path.join(harness.directory, "workspace");
+    await mkdir(root);
+    try {
+      await harness.adapter.start();
+      const thread = await harness.adapter.startThread({
+        root,
+        model: "gpt-6-luna",
+      });
+      await harness.adapter.startTurn({
+        threadId: thread.threadId,
+        root,
+        model: "gpt-6-luna",
+        effort: "max",
+        prompt: "Summarize without changing files.",
+        mode: "default",
+      });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      const usageEvents = events.filter(
+        (event) =>
+          event.type === "usage_updated" || event.type === "usage_invalid",
+      );
+      const valid = usageEvents.filter(
+        (event) => event.type === "usage_updated",
+      );
+      const invalid = usageEvents.filter(
+        (event) => event.type === "usage_invalid",
+      );
+      expect(valid).toHaveLength(5);
+      expect(invalid).toHaveLength(15);
+      expect(valid[0]).toMatchObject({
+        type: "usage_updated",
+        total: {
+          input_tokens: 0,
+          cached_input_tokens: 0,
+          cache_write_input_tokens: 0,
+          output_tokens: 0,
+          reasoning_output_tokens: 0,
+          total_tokens: 0,
+        },
+        last: {
+          input_tokens: 0,
+          cached_input_tokens: 0,
+          cache_write_input_tokens: 0,
+          output_tokens: 0,
+          reasoning_output_tokens: 0,
+          total_tokens: 0,
+        },
+        modelContextWindow: 4096,
+      });
+      expect(valid[1]).toMatchObject({
+        type: "usage_updated",
+        total: {
+          input_tokens: Number.MAX_SAFE_INTEGER,
+          cached_input_tokens: Number.MAX_SAFE_INTEGER,
+          cache_write_input_tokens: 0,
+          output_tokens: Number.MAX_SAFE_INTEGER,
+          reasoning_output_tokens: Number.MAX_SAFE_INTEGER,
+          total_tokens: Number.MAX_SAFE_INTEGER,
+        },
+      });
+      expect(valid[1]).not.toHaveProperty("modelContextWindow");
+      expect(valid[2]).toMatchObject({
+        type: "usage_updated",
+        modelContextWindow: null,
+      });
+      expect(valid.map((event) => event.threadId)).toContain(
+        "unrelated-private-thread-id",
+      );
+      const serialized = JSON.stringify(usageEvents);
+      expect(serialized).not.toContain("PRIVATE_USAGE_PAYLOAD_SENTINEL");
+      expect(serialized).not.toContain("PRIVATE_UNKNOWN_FIELD_SENTINEL");
+    } finally {
+      unsubscribe();
+      await harness.adapter.close();
+    }
   });
 
   it("validates the pinned launcher version and uses it when App Server omits its version", async () => {

@@ -402,6 +402,7 @@ function processRequest(request) {
     const policy = params.sandboxPolicy ?? {};
     const root = params.runtimeWorkspaceRoots?.[0];
     executionTurnStartCount += 1;
+    const currentTurnStartCount = executionTurnStartCount;
     record({
       kind: "execution-security-check",
       oneRuntimeRoot: params.runtimeWorkspaceRoots?.length === 1,
@@ -463,18 +464,210 @@ function processRequest(request) {
         turn: { id: executionTurnId, status: "inProgress", items: [] },
       },
     });
-    send({
-      method: "item/started",
-      params: {
-        threadId: params.threadId,
-        turnId: executionTurnId,
-        item: {
-          id: "private-command-item",
-          type: "commandExecution",
-          command: "not captured",
+    if (!mode.startsWith("m6-")) {
+      send({
+        method: "item/started",
+        params: {
+          threadId: params.threadId,
+          turnId: executionTurnId,
+          startedAtMs: Date.now(),
+          item: {
+            id: "private-command-item",
+            type: "commandExecution",
+            command: "not captured",
+          },
         },
-      },
-    });
+      });
+    }
+    const telemetryStart = Date.now();
+    if (mode === "m6-parser-cases") {
+      const full = {
+        inputTokens: 0,
+        cachedInputTokens: 0,
+        cacheWriteInputTokens: 0,
+        outputTokens: 0,
+        reasoningOutputTokens: 0,
+        totalTokens: 0,
+      };
+      const sendUsage = (tokenUsage, overrides = {}) =>
+        send({
+          method: "thread/tokenUsage/updated",
+          params: {
+            threadId: params.threadId,
+            turnId: executionTurnId,
+            tokenUsage,
+            ...overrides,
+          },
+        });
+      sendUsage({ total: full, last: full, modelContextWindow: 4096 });
+      const maximum = {
+        inputTokens: Number.MAX_SAFE_INTEGER,
+        cachedInputTokens: Number.MAX_SAFE_INTEGER,
+        outputTokens: Number.MAX_SAFE_INTEGER,
+        reasoningOutputTokens: Number.MAX_SAFE_INTEGER,
+        totalTokens: Number.MAX_SAFE_INTEGER,
+      };
+      sendUsage({ total: maximum, last: maximum });
+      sendUsage(
+        {
+          total: { ...maximum, cacheWriteInputTokens: 0 },
+          last: { ...maximum, cacheWriteInputTokens: 0 },
+          modelContextWindow: null,
+          privateTokenUsageField: "PRIVATE_UNKNOWN_FIELD_SENTINEL",
+        },
+        { privatePayload: "PRIVATE_USAGE_PAYLOAD_SENTINEL" },
+      );
+      for (const omitted of [
+        "inputTokens",
+        "cachedInputTokens",
+        "outputTokens",
+        "reasoningOutputTokens",
+        "totalTokens",
+      ]) {
+        const incomplete = { ...full };
+        delete incomplete[omitted];
+        sendUsage({ total: incomplete, last: full });
+      }
+      sendUsage({ total: full, last: null });
+      sendUsage({ total: full });
+      for (const invalid of [-1, 0.5, Number.MAX_SAFE_INTEGER + 1]) {
+        sendUsage({
+          total: { ...full, inputTokens: invalid },
+          last: full,
+        });
+      }
+      for (const modelContextWindow of [
+        0,
+        -1,
+        1.5,
+        Number.MAX_SAFE_INTEGER + 1,
+        "4096",
+      ]) {
+        sendUsage({ total: full, last: full, modelContextWindow });
+      }
+      sendUsage({ total: full, last: full }, { threadId: "x".repeat(513) });
+      sendUsage({ total: full, last: full }, { turnId: undefined });
+      sendUsage(
+        { total: full, last: full },
+        { threadId: "unrelated-private-thread-id" },
+      );
+    } else if (mode.startsWith("m6-")) {
+      const initialTotal =
+        currentTurnStartCount === 1
+          ? {
+              inputTokens: 50,
+              cachedInputTokens: 10,
+              cacheWriteInputTokens: 3,
+              outputTokens: 20,
+              reasoningOutputTokens: 8,
+              totalTokens: 70,
+            }
+          : {
+              inputTokens: 150,
+              cachedInputTokens: 20,
+              cacheWriteInputTokens: 5,
+              outputTokens: 30,
+              reasoningOutputTokens: 15,
+              totalTokens: 180,
+            };
+      const initialLast = {
+        inputTokens: 10,
+        cachedInputTokens: 1,
+        outputTokens: 3,
+        reasoningOutputTokens: 1,
+        totalTokens: 13,
+      };
+      if (mode === "m6-routing") {
+        const unrelatedUsage = {
+          last: initialLast,
+          total: {
+            inputTokens: 999,
+            cachedInputTokens: 999,
+            cacheWriteInputTokens: 999,
+            outputTokens: 999,
+            reasoningOutputTokens: 999,
+            totalTokens: 999,
+          },
+        };
+        send({
+          method: "thread/tokenUsage/updated",
+          params: {
+            threadId: params.threadId,
+            turnId: "stale-private-turn-id",
+            tokenUsage: unrelatedUsage,
+          },
+        });
+        send({
+          method: "thread/tokenUsage/updated",
+          params: {
+            threadId: "unrelated-private-thread-id",
+            turnId: executionTurnId,
+            tokenUsage: unrelatedUsage,
+          },
+        });
+        send({
+          method: "thread/tokenUsage/updated",
+          params: {
+            threadId: params.threadId,
+            tokenUsage: unrelatedUsage,
+          },
+        });
+      }
+      const initialUsageNotification = {
+        method: "thread/tokenUsage/updated",
+        params: {
+          threadId: params.threadId,
+          turnId: executionTurnId,
+          tokenUsage: {
+            last: initialLast,
+            total: initialTotal,
+            modelContextWindow: currentTurnStartCount === 1 ? 258400 : 262144,
+            privateTokenUsageField: "PRIVATE_UNKNOWN_FIELD_SENTINEL",
+          },
+          privatePayload: "PRIVATE_USAGE_PAYLOAD_SENTINEL",
+        },
+      };
+      send(initialUsageNotification);
+      if (mode === "m6-repeated-last") send(initialUsageNotification);
+      if (mode === "m6-malformed-usage") {
+        send({
+          method: "thread/tokenUsage/updated",
+          params: {
+            threadId: params.threadId,
+            turnId: executionTurnId,
+            tokenUsage: {
+              last: { ...initialLast, inputTokens: -1 },
+              total: initialTotal,
+              modelContextWindow: currentTurnStartCount === 1 ? 258400 : 262144,
+            },
+            privatePayload: "PRIVATE_USAGE_PAYLOAD_SENTINEL",
+          },
+        });
+      }
+      for (const [itemId, type] of [
+        ["private-command-activity-id", "commandExecution"],
+        ["private-file-activity-id", "fileChange"],
+        ["private-mcp-activity-id", "mcpToolCall"],
+        ["private-dynamic-activity-id", "dynamicToolCall"],
+        ["private-other-activity-id", "webSearch"],
+      ]) {
+        send({
+          method: "item/started",
+          params: {
+            threadId: params.threadId,
+            turnId: executionTurnId,
+            startedAtMs: telemetryStart,
+            item: {
+              id: `${itemId}-${currentTurnStartCount}`,
+              type,
+              command: "PRIVATE_COMMAND_SENTINEL",
+              cwd: "C:\\private\\project\\root",
+              arguments: { prompt: "PRIVATE_TOOL_ARGUMENT_SENTINEL" },
+            },
+          },
+        });
+      }
+    }
     if (mode === "process-death") {
       send({
         id: request.id,
@@ -489,7 +682,7 @@ function processRequest(request) {
     });
     if (
       mode === "execution-uncorrelated-after-two" &&
-      executionTurnStartCount === 2
+      currentTurnStartCount === 2
     ) {
       setTimeout(() => {
         send({
@@ -505,6 +698,79 @@ function processRequest(request) {
     }
     const complete = () => {
       if (mode === "delayed-turn") return;
+      if (mode.startsWith("m6-")) {
+        const finalTotal =
+          mode === "m6-decreasing-usage"
+            ? {
+                inputTokens: 40,
+                cachedInputTokens: 2,
+                cacheWriteInputTokens: 0,
+                outputTokens: 10,
+                reasoningOutputTokens: 3,
+                totalTokens: 50,
+              }
+            : currentTurnStartCount === 1
+              ? {
+                  inputTokens: 100,
+                  cachedInputTokens: 10,
+                  cacheWriteInputTokens: 4,
+                  outputTokens: 20,
+                  reasoningOutputTokens: 10,
+                  totalTokens: 120,
+                }
+              : {
+                  inputTokens: 200,
+                  cachedInputTokens: 25,
+                  cacheWriteInputTokens: 6,
+                  outputTokens: 40,
+                  reasoningOutputTokens: 18,
+                  totalTokens: 240,
+                };
+        const finalLast = {
+          inputTokens: 60,
+          cachedInputTokens: 8,
+          cacheWriteInputTokens: 2,
+          outputTokens: 10,
+          reasoningOutputTokens: 6,
+          totalTokens: 70,
+        };
+        send({
+          method: "thread/tokenUsage/updated",
+          params: {
+            threadId: params.threadId,
+            turnId: executionTurnId,
+            tokenUsage: {
+              last: finalLast,
+              total: finalTotal,
+            },
+          },
+        });
+        for (const [itemId, type, status] of [
+          ["private-command-activity-id", "commandExecution", "completed"],
+          ["private-file-activity-id", "fileChange", "completed"],
+          ["private-mcp-activity-id", "mcpToolCall", "failed"],
+          ["private-dynamic-activity-id", "dynamicToolCall", "completed"],
+          ["private-other-activity-id", "webSearch", "completed"],
+        ]) {
+          send({
+            method: "item/completed",
+            params: {
+              threadId: params.threadId,
+              turnId: executionTurnId,
+              completedAtMs: telemetryStart + 25,
+              item: {
+                id: `${itemId}-${currentTurnStartCount}`,
+                type,
+                status,
+                command: "PRIVATE_COMMAND_SENTINEL",
+                cwd: "C:\\private\\project\\root",
+                arguments: { prompt: "PRIVATE_TOOL_ARGUMENT_SENTINEL" },
+                output: "PRIVATE_TOOL_OUTPUT_SENTINEL",
+              },
+            },
+          });
+        }
+      }
       send({
         method: "item/completed",
         params: {
@@ -535,19 +801,49 @@ function processRequest(request) {
             id: executionTurnId,
             status:
               mode === "turn-failed" ||
-              (mode === "terminal-mapping" && executionTurnStartCount === 1)
+              (mode === "terminal-mapping" && currentTurnStartCount === 1)
                 ? "failed"
                 : mode === "turn-interrupted" ||
-                    (mode === "terminal-mapping" &&
-                      executionTurnStartCount === 2)
+                    (mode === "terminal-mapping" && currentTurnStartCount === 2)
                   ? "interrupted"
                   : "completed",
             items: [],
           },
         },
       });
+      if (mode === "m6-post-terminal-usage") {
+        setTimeout(() => {
+          record({ kind: "m6-post-terminal-notification-sent" });
+          send({
+            method: "thread/tokenUsage/updated",
+            params: {
+              threadId: params.threadId,
+              turnId: executionTurnId,
+              tokenUsage: {
+                last: {
+                  inputTokens: 999,
+                  cachedInputTokens: 999,
+                  cacheWriteInputTokens: 999,
+                  outputTokens: 999,
+                  reasoningOutputTokens: 999,
+                  totalTokens: 999,
+                },
+                total: {
+                  inputTokens: 999,
+                  cachedInputTokens: 999,
+                  cacheWriteInputTokens: 999,
+                  outputTokens: 999,
+                  reasoningOutputTokens: 999,
+                  totalTokens: 999,
+                },
+              },
+            },
+          });
+        }, 25);
+      }
     };
     const sendsInput = [
+      "m6-input-telemetry",
       "execution-server-request",
       "execution-server-request-fast",
       "execution-server-request-single",
@@ -668,6 +964,7 @@ function processRequest(request) {
       mode === "delayed-interrupt" ||
       mode === "interrupt-failure" ||
       mode === "execution-uncorrelated-after-two" ||
+      mode === "m6-input-telemetry" ||
       mode === "execution-server-request" ||
       mode === "execution-server-request-fast" ||
       mode === "execution-server-request-single" ||

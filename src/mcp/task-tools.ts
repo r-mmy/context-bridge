@@ -822,7 +822,7 @@ export function registerTaskTools(server: McpServer, host: TaskToolHost): void {
     "task_get",
     {
       description:
-        "Get a registration-checked task snapshot, sanitized lifecycle events, bounded final response, usage placeholders, and optional bounded long-poll updates.",
+        "Get a registration-checked task snapshot, sanitized lifecycle events, bounded final response, bounded usage telemetry, and optional bounded long-poll updates.",
       inputSchema: TaskGetInputSchema,
       outputSchema: TaskGetOutputSchema,
       annotations: READ_ONLY_TASK,

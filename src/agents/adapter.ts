@@ -1,5 +1,6 @@
 import type { AgentProfile } from "./profiles.js";
 import { AgentAdapterError } from "./errors.js";
+import type { ActivityKind, TokenBreakdown } from "../tasks/types.js";
 
 export interface AgentModel {
   id: string;
@@ -66,6 +67,32 @@ export type AgentExecutionEvent =
       isBlocking: boolean;
       questions: AgentUserInputQuestion[];
       duplicate?: boolean;
+    }
+  | {
+      type: "usage_updated";
+      threadId: string;
+      turnId: string;
+      total: TokenBreakdown;
+      last: TokenBreakdown;
+      modelContextWindow?: number | null;
+    }
+  | { type: "usage_invalid"; threadId: string; turnId: string }
+  | {
+      type: "activity_started";
+      threadId: string;
+      turnId: string;
+      itemId: string;
+      activityKind: ActivityKind;
+      startedAtMs: number;
+    }
+  | {
+      type: "activity_completed";
+      threadId: string;
+      turnId: string;
+      itemId: string;
+      activityKind: ActivityKind;
+      completedAtMs: number;
+      failed: boolean;
     }
   | { type: "session_failed" };
 

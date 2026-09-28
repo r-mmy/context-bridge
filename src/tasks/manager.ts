@@ -13,11 +13,14 @@ import {
   MAX_TASKS,
   MAX_TOTAL_TASK_BYTES,
   MAX_TURNS_PER_TASK,
+  ACTIVITY_KINDS,
   PendingInputSchema,
   START_IDEMPOTENCY_SCHEMA,
   TimestampSchema,
   TaskEventSchema,
   TaskRecordSchema,
+  TokenBreakdownSchema,
+  emptyActivitySummary,
   emptyTaskUsageSummary,
   emptyTurnUsage,
   hashText,
@@ -25,6 +28,7 @@ import {
   summarizePrompt,
   truncateUtf8,
   type FinalResponse,
+  type ActivityKind,
   type GitBaseline,
   type IdempotencyRecord,
   type PendingInput,
@@ -34,6 +38,7 @@ import {
   type TaskRecord,
   type TaskState,
   type TaskView,
+  type TokenBreakdown,
 } from "./types.js";
 
 const IntentBindingSchema = z
@@ -204,6 +209,92 @@ function isTerminal(state: TaskState): boolean {
     state === "cancelled" ||
     state === "interrupted"
   );
+}
+
+const MAX_ACTIVITY_DURATION_MS = 24 * 60 * 60 * 1_000;
+const TOKEN_BREAKDOWN_FIELDS = [
+  "input_tokens",
+  "cached_input_tokens",
+  "cache_write_input_tokens",
+  "output_tokens",
+  "reasoning_output_tokens",
+  "total_tokens",
+] as const satisfies readonly (keyof TokenBreakdown)[];
+
+function isCompleteTokenBreakdown(
+  value: TokenBreakdown | null,
+): value is TokenBreakdown {
+  return (
+    value !== null &&
+    TOKEN_BREAKDOWN_FIELDS.every((field) => {
+      const count = value[field];
+      return typeof count === "number" && Number.isSafeInteger(count);
+    })
+  );
+}
+
+function finalizeTurnUsage(
+  record: TaskRecord,
+  turnNumber: number,
+  terminalObserved: boolean,
+): void {
+  const turn = record.turns[turnNumber - 1];
+  if (!turn) throw new TaskError("task_store_error");
+  const hadSnapshot = turn.usage.latest_last !== null;
+  const alreadyDegraded = turn.usage.delta_quality === "degraded";
+  turn.usage.turn_delta = null;
+  if (!terminalObserved) {
+    turn.usage.end_total = null;
+    turn.usage.delta_quality =
+      hadSnapshot || alreadyDegraded ? "degraded" : "unavailable";
+    record.usage_summary.delta_quality = turn.usage.delta_quality;
+    return;
+  }
+  if (!hadSnapshot) {
+    turn.usage.end_total = null;
+    turn.usage.delta_quality = alreadyDegraded ? "degraded" : "unavailable";
+  } else {
+    const end = record.usage_summary.thread_total;
+    turn.usage.end_total = safeClone(end);
+    const start = turn.usage.start_total;
+    if (
+      alreadyDegraded ||
+      !isCompleteTokenBreakdown(start) ||
+      !isCompleteTokenBreakdown(end)
+    ) {
+      turn.usage.delta_quality = "degraded";
+    } else {
+      const delta = {} as TokenBreakdown;
+      let monotonic = true;
+      for (const field of TOKEN_BREAKDOWN_FIELDS) {
+        const startCount = start[field];
+        const endCount = end[field];
+        if (
+          typeof startCount !== "number" ||
+          typeof endCount !== "number" ||
+          endCount < startCount
+        ) {
+          monotonic = false;
+          break;
+        }
+        delta[field] = endCount - startCount;
+      }
+      if (monotonic) {
+        turn.usage.turn_delta = delta;
+        turn.usage.delta_quality = "authoritative_delta";
+      } else {
+        turn.usage.delta_quality = "degraded";
+      }
+    }
+  }
+  record.usage_summary.delta_quality = turn.usage.delta_quality;
+}
+
+function incrementActivityCount(value: number): number {
+  if (value >= Number.MAX_SAFE_INTEGER) {
+    throw new TaskError("task_store_capacity");
+  }
+  return value + 1;
 }
 
 function errorCodeForState(state: TaskState): SafeTaskErrorCode | null {
@@ -393,6 +484,7 @@ export class TaskManager {
           final_response: null,
           safe_error: null,
           usage: emptyTurnUsage(),
+          activity_summary: emptyActivitySummary(),
         };
         const record: TaskRecord = {
           schema_version: 1,
@@ -564,6 +656,7 @@ export class TaskManager {
           final_response: null,
           safe_error: null,
           usage: emptyTurnUsage(),
+          activity_summary: emptyActivitySummary(),
         };
         record.turns.push(turn);
         record.turn_count = turnNumber;
@@ -667,6 +760,7 @@ export class TaskManager {
     taskId: string,
     turnNumber: number,
     nextState: TaskState,
+    terminalObserved = false,
   ): Promise<TaskRecord> {
     this.assertOwner();
     taskId = normalizeTaskId(taskId);
@@ -703,6 +797,9 @@ export class TaskManager {
       turn.safe_error = errorCodeForState(nextState)
         ? { code: errorCodeForState(nextState)! }
         : null;
+      if (isTerminal(nextState)) {
+        finalizeTurnUsage(record, turnNumber, terminalObserved);
+      }
       record.state = nextState;
       record.updated_at = now;
       record.pending_input = null;
@@ -837,6 +934,7 @@ export class TaskManager {
   async requireLocalAction(
     taskId: string,
     turnNumber: number,
+    terminalObserved = false,
   ): Promise<TaskRecord> {
     this.assertOwner();
     taskId = normalizeTaskId(taskId);
@@ -866,6 +964,7 @@ export class TaskManager {
       turn.state = "interrupted";
       turn.completed_at = now;
       turn.safe_error = { code: "secret_input_requires_local_action" };
+      finalizeTurnUsage(record, turnNumber, terminalObserved);
       record.state = "interrupted";
       record.pending_input = null;
       record.local_action_required = true;
@@ -897,6 +996,251 @@ export class TaskManager {
       await this.persistReplacement(record);
       this.signals.notify(taskId);
       return record;
+    });
+  }
+
+  async setTurnUsageStartTotal(
+    taskId: string,
+    turnNumber: number,
+    startTotal: TokenBreakdown | null,
+  ): Promise<void> {
+    this.assertOwner();
+    taskId = normalizeTaskId(taskId);
+    const parsed = TokenBreakdownSchema.nullable().safeParse(startTotal);
+    if (!parsed.success) throw new TaskError("task_invalid_input");
+    await this.withKeyQueue(this.taskQueues, taskId, async () => {
+      const record = await this.store.read(taskId);
+      const turn = record.turns[turnNumber - 1];
+      if (
+        !turn ||
+        turn.turn_number !== turnNumber ||
+        turnNumber !== record.turn_count ||
+        turn.state !== "queued"
+      ) {
+        throw new TaskError("task_state_conflict");
+      }
+      turn.usage.start_total = safeClone(parsed.data);
+      record.updated_at = new Date().toISOString();
+      await this.persistReplacement(record);
+      this.signals.notify(taskId);
+    });
+  }
+
+  async recordThreadUsage(
+    taskId: string,
+    turnNumber: number,
+    input: {
+      total: TokenBreakdown;
+      last: TokenBreakdown;
+      model_context_window?: number | null;
+    },
+  ): Promise<void> {
+    this.assertOwner();
+    taskId = normalizeTaskId(taskId);
+    const total = TokenBreakdownSchema.safeParse(input.total);
+    const last = TokenBreakdownSchema.safeParse(input.last);
+    const contextValid =
+      input.model_context_window === undefined ||
+      input.model_context_window === null ||
+      (Number.isSafeInteger(input.model_context_window) &&
+        input.model_context_window > 0);
+    if (!total.success || !last.success || !contextValid) {
+      throw new TaskError("task_invalid_input");
+    }
+    await this.withKeyQueue(this.taskQueues, taskId, async () => {
+      const record = await this.store.read(taskId);
+      const turn = record.turns[turnNumber - 1];
+      if (
+        !turn ||
+        turn.turn_number !== turnNumber ||
+        turnNumber !== record.turn_count ||
+        (turn.state !== "running" && turn.state !== "waiting_for_input")
+      ) {
+        throw new TaskError("task_state_conflict");
+      }
+      const now = new Date().toISOString();
+      const totalSnapshot = safeClone(total.data);
+      const lastSnapshot = safeClone(last.data);
+      const regressed = TOKEN_BREAKDOWN_FIELDS.some((field) => {
+        const previous = record.usage_summary.thread_total[field];
+        const current = totalSnapshot[field];
+        return (
+          typeof previous === "number" &&
+          typeof current === "number" &&
+          current < previous
+        );
+      });
+      // Cumulative counters are monotonic. If the server reports a
+      // regression, retain the last defensible total and degrade the delta
+      // instead of replacing it with a lower snapshot.
+      if (!regressed) record.usage_summary.thread_total = totalSnapshot;
+      record.usage_summary.latest_last = lastSnapshot;
+      turn.usage.latest_last = lastSnapshot;
+      if (regressed) {
+        turn.usage.delta_quality = "degraded";
+        record.usage_summary.delta_quality = "degraded";
+      }
+      if (
+        input.model_context_window !== undefined &&
+        input.model_context_window !== null
+      ) {
+        record.usage_summary.model_context_window = input.model_context_window;
+        turn.usage.model_context_window = input.model_context_window;
+      }
+      record.updated_at = now;
+      appendTaskEventToRecord(
+        record,
+        {
+          turn_number: turnNumber,
+          category: "runtime",
+          kind: "activity",
+          status: "observed",
+        },
+        now,
+      );
+      await this.persistReplacement(record);
+      this.signals.notify(taskId);
+    });
+  }
+
+  async markTurnUsageDegraded(
+    taskId: string,
+    turnNumber: number,
+  ): Promise<void> {
+    this.assertOwner();
+    taskId = normalizeTaskId(taskId);
+    await this.withKeyQueue(this.taskQueues, taskId, async () => {
+      const record = await this.store.read(taskId);
+      const turn = record.turns[turnNumber - 1];
+      if (
+        !turn ||
+        turn.turn_number !== turnNumber ||
+        turnNumber !== record.turn_count ||
+        (turn.state !== "running" && turn.state !== "waiting_for_input")
+      ) {
+        throw new TaskError("task_state_conflict");
+      }
+      turn.usage.delta_quality = "degraded";
+      record.usage_summary.delta_quality = "degraded";
+      const now = new Date().toISOString();
+      record.updated_at = now;
+      appendTaskEventToRecord(
+        record,
+        {
+          turn_number: turnNumber,
+          category: "runtime",
+          kind: "activity",
+          status: "observed",
+        },
+        now,
+      );
+      await this.persistReplacement(record);
+      this.signals.notify(taskId);
+    });
+  }
+
+  async recordActivityStarted(
+    taskId: string,
+    turnNumber: number,
+    activityKind: ActivityKind,
+  ): Promise<void> {
+    this.assertOwner();
+    taskId = normalizeTaskId(taskId);
+    if (!ACTIVITY_KINDS.includes(activityKind)) {
+      throw new TaskError("task_invalid_input");
+    }
+    await this.withKeyQueue(this.taskQueues, taskId, async () => {
+      const record = await this.store.read(taskId);
+      const turn = record.turns[turnNumber - 1];
+      if (
+        !turn ||
+        turn.turn_number !== turnNumber ||
+        turnNumber !== record.turn_count ||
+        (turn.state !== "running" && turn.state !== "waiting_for_input")
+      ) {
+        throw new TaskError("task_state_conflict");
+      }
+      const aggregate = turn.activity_summary[activityKind];
+      aggregate.started_count = incrementActivityCount(aggregate.started_count);
+      const now = new Date().toISOString();
+      record.updated_at = now;
+      appendTaskEventToRecord(
+        record,
+        {
+          turn_number: turnNumber,
+          category: "runtime",
+          kind: "activity",
+          status: "observed",
+        },
+        now,
+      );
+      await this.persistReplacement(record);
+      this.signals.notify(taskId);
+    });
+  }
+
+  async recordActivityCompleted(
+    taskId: string,
+    turnNumber: number,
+    activityKind: ActivityKind,
+    failed: boolean,
+    durationMs: number | null,
+  ): Promise<void> {
+    this.assertOwner();
+    taskId = normalizeTaskId(taskId);
+    if (
+      !ACTIVITY_KINDS.includes(activityKind) ||
+      typeof failed !== "boolean" ||
+      (durationMs !== null &&
+        (!Number.isSafeInteger(durationMs) ||
+          durationMs < 0 ||
+          durationMs > MAX_ACTIVITY_DURATION_MS))
+    ) {
+      throw new TaskError("task_invalid_input");
+    }
+    await this.withKeyQueue(this.taskQueues, taskId, async () => {
+      const record = await this.store.read(taskId);
+      const turn = record.turns[turnNumber - 1];
+      if (
+        !turn ||
+        turn.turn_number !== turnNumber ||
+        turnNumber !== record.turn_count ||
+        (turn.state !== "running" && turn.state !== "waiting_for_input")
+      ) {
+        throw new TaskError("task_state_conflict");
+      }
+      const aggregate = turn.activity_summary[activityKind];
+      aggregate.completed_count = incrementActivityCount(
+        aggregate.completed_count,
+      );
+      if (failed) {
+        aggregate.failed_count = incrementActivityCount(aggregate.failed_count);
+      }
+      if (durationMs !== null) {
+        const total = (aggregate.duration_total_ms ?? 0) + durationMs;
+        if (!Number.isSafeInteger(total)) {
+          throw new TaskError("task_store_capacity");
+        }
+        aggregate.duration_sample_count = incrementActivityCount(
+          aggregate.duration_sample_count,
+        );
+        aggregate.duration_total_ms = total;
+      }
+      const now = new Date().toISOString();
+      record.updated_at = now;
+      appendTaskEventToRecord(
+        record,
+        {
+          turn_number: turnNumber,
+          category: "runtime",
+          kind: "activity",
+          status: failed ? "failed" : "observed",
+          duration_ms: durationMs,
+        },
+        now,
+      );
+      await this.persistReplacement(record);
+      this.signals.notify(taskId);
     });
   }
 

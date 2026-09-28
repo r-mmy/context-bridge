@@ -26,9 +26,11 @@ import {
   MAX_TASK_FILE_BYTES,
   TaskRecordSchema,
   TokenBreakdownSchema,
+  emptyActivitySummary,
   hashText,
   summarizePrompt,
   truncateUtf8,
+  zeroTokenBreakdown,
   type TaskRecord,
   type TaskState,
 } from "../src/tasks/types.js";
@@ -215,6 +217,229 @@ describe.sequential("task persistence and manager", () => {
     expect(
       (await harness.store.read(record.task_id)).detected_codex_version,
     ).toBe("1.2.3");
+  });
+
+  it("stores cumulative usage and sanitized activity aggregates beyond event truncation", async () => {
+    const harness = await createHarness();
+    const { allocation } = await createTask(harness);
+    const manager = harness.runtime.manager;
+    await manager.setTurnUsageStartTotal(
+      allocation.task_id,
+      allocation.turn_number,
+      zeroTokenBreakdown(),
+    );
+    await manager.transitionTurn(
+      allocation.task_id,
+      allocation.turn_number,
+      "running",
+    );
+    const total = {
+      input_tokens: 50,
+      cached_input_tokens: 10,
+      cache_write_input_tokens: 3,
+      output_tokens: 20,
+      reasoning_output_tokens: 8,
+      total_tokens: 70,
+    };
+    await manager.recordThreadUsage(allocation.task_id, 1, {
+      total,
+      last: total,
+      model_context_window: 258_400,
+    });
+    await manager.recordActivityStarted(
+      allocation.task_id,
+      1,
+      "command_execution",
+    );
+    await manager.recordActivityCompleted(
+      allocation.task_id,
+      1,
+      "command_execution",
+      false,
+      42,
+    );
+    await manager.recordActivityCompleted(
+      allocation.task_id,
+      1,
+      "file_change",
+      true,
+      null,
+    );
+    await manager.transitionTurn(
+      allocation.task_id,
+      allocation.turn_number,
+      "completed",
+      true,
+    );
+
+    const record = await harness.store.read(allocation.task_id);
+    expect(record.turns[0]?.usage).toMatchObject({
+      start_total: zeroTokenBreakdown(),
+      end_total: total,
+      latest_last: total,
+      turn_delta: total,
+      model_context_window: 258_400,
+      delta_quality: "authoritative_delta",
+      model_request_count: null,
+    });
+    expect(record.usage_summary.thread_total).toEqual(total);
+    expect(record.turns[0]?.activity_summary).toMatchObject({
+      command_execution: {
+        started_count: 1,
+        completed_count: 1,
+        failed_count: 0,
+        duration_sample_count: 1,
+        duration_total_ms: 42,
+      },
+      file_change: {
+        started_count: 0,
+        completed_count: 1,
+        failed_count: 1,
+        duration_sample_count: 0,
+        duration_total_ms: null,
+      },
+    });
+
+    const timestamp = new Date().toISOString();
+    for (let index = 0; index < MAX_EVENTS_PER_TASK + 1; index += 1) {
+      appendTaskEventToRecord(
+        record,
+        {
+          turn_number: 1,
+          category: "runtime",
+          kind: "activity",
+          status: "observed",
+        },
+        timestamp,
+      );
+    }
+    await harness.store.replace(record);
+    const truncated = await harness.store.read(allocation.task_id);
+    expect(truncated.events.length).toBe(MAX_EVENTS_PER_TASK);
+    expect(truncated.events_truncated_before_seq).toBeGreaterThan(0);
+    expect(truncated.turns[0]?.activity_summary).toEqual(
+      record.turns[0]?.activity_summary,
+    );
+  });
+
+  it("loads earlier v1 records without activity summaries using bounded defaults", async () => {
+    const harness = await createHarness();
+    const { allocation } = await createTask(harness);
+    const legacy = await harness.store.read(allocation.task_id);
+    delete (legacy.turns[0] as unknown as Record<string, unknown>)[
+      "activity_summary"
+    ];
+    await writeFile(
+      getTaskPath(allocation.task_id),
+      `${JSON.stringify(legacy)}\n`,
+      "utf8",
+    );
+
+    const loaded = await harness.store.read(allocation.task_id);
+    expect(loaded.schema_version).toBe(1);
+    expect(loaded.turns[0]?.activity_summary).toEqual(emptyActivitySummary());
+  });
+
+  it("does not fabricate an end snapshot when a turn is interrupted without terminal observation", async () => {
+    const harness = await createHarness();
+    const { allocation } = await createTask(harness);
+    const manager = harness.runtime.manager;
+    await manager.setTurnUsageStartTotal(
+      allocation.task_id,
+      allocation.turn_number,
+      zeroTokenBreakdown(),
+    );
+    await manager.transitionTurn(
+      allocation.task_id,
+      allocation.turn_number,
+      "running",
+    );
+    const snapshot = {
+      input_tokens: 12,
+      cached_input_tokens: 2,
+      cache_write_input_tokens: 1,
+      output_tokens: 5,
+      reasoning_output_tokens: 3,
+      total_tokens: 17,
+    };
+    await manager.recordThreadUsage(allocation.task_id, 1, {
+      total: snapshot,
+      last: snapshot,
+      model_context_window: 258_400,
+    });
+    await manager.recordThreadUsage(allocation.task_id, 1, {
+      total: {
+        input_tokens: 10,
+        cached_input_tokens: 1,
+        cache_write_input_tokens: 0,
+        output_tokens: 4,
+        reasoning_output_tokens: 2,
+        total_tokens: 14,
+      },
+      last: {
+        input_tokens: 3,
+        cached_input_tokens: 0,
+        cache_write_input_tokens: 0,
+        output_tokens: 1,
+        reasoning_output_tokens: 0,
+        total_tokens: 4,
+      },
+      model_context_window: null,
+    });
+    await manager.transitionTurn(
+      allocation.task_id,
+      allocation.turn_number,
+      "interrupted",
+    );
+
+    const record = await harness.store.read(allocation.task_id);
+    expect(record.usage_summary.thread_total).toEqual(snapshot);
+    expect(record.usage_summary.latest_last).toEqual({
+      input_tokens: 3,
+      cached_input_tokens: 0,
+      cache_write_input_tokens: 0,
+      output_tokens: 1,
+      reasoning_output_tokens: 0,
+      total_tokens: 4,
+    });
+    expect(record.usage_summary.model_context_window).toBe(258_400);
+    expect(record.turns[0]?.usage).toMatchObject({
+      end_total: null,
+      latest_last: record.usage_summary.latest_last,
+      turn_delta: null,
+      delta_quality: "degraded",
+      model_context_window: 258_400,
+    });
+  });
+
+  it("marks a valid terminal snapshot degraded when no start baseline exists", async () => {
+    const harness = await createHarness();
+    const { allocation } = await createTask(harness);
+    const manager = harness.runtime.manager;
+    await manager.setTurnUsageStartTotal(allocation.task_id, 1, null);
+    await manager.transitionTurn(allocation.task_id, 1, "running");
+    const snapshot = {
+      input_tokens: 12,
+      cached_input_tokens: 2,
+      cache_write_input_tokens: 1,
+      output_tokens: 5,
+      reasoning_output_tokens: 3,
+      total_tokens: 17,
+    };
+    await manager.recordThreadUsage(allocation.task_id, 1, {
+      total: snapshot,
+      last: snapshot,
+    });
+    await manager.transitionTurn(allocation.task_id, 1, "completed", true);
+
+    const record = await harness.store.read(allocation.task_id);
+    expect(record.turns[0]?.usage).toMatchObject({
+      start_total: null,
+      end_total: snapshot,
+      turn_delta: null,
+      delta_quality: "degraded",
+      model_request_count: null,
+    });
   });
 
   it("retries reads after a transient path identity change during atomic replacement", async () => {
