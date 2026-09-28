@@ -49,12 +49,18 @@ export interface AgentExecutionAdapter extends AgentAdapter {
     root: string;
     model: string;
   }): Promise<AgentExecutionThread>;
+  resumeThread(input: {
+    threadId: string;
+    root: string;
+    model: string;
+  }): Promise<AgentExecutionThread>;
   startTurn(input: {
     threadId: string;
     root: string;
     model: string;
     effort: string;
     prompt: string;
+    mode: "default" | "plan";
   }): Promise<AgentExecutionTurn>;
   interruptTurn(input: { threadId: string; turnId: string }): Promise<void>;
   setThreadName(input: { threadId: string; name: string }): Promise<void>;

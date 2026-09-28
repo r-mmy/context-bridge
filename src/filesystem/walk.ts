@@ -5,9 +5,11 @@ import picomatch from "picomatch";
 import type { ProjectRecord } from "../projects/registry.js";
 import { ContextBridgeError } from "../security/errors.js";
 import {
+  createProjectIgnoreMatcherCache,
   isHiddenPath,
   isProjectPathVisible,
   resolveProjectPath,
+  type ProjectIgnoreMatcherCache,
   type ResolvedPath,
 } from "../security/paths.js";
 import { clampOutputBytes, readSearchText } from "./read.js";
@@ -60,11 +62,13 @@ interface WalkPath {
 async function resolveWalkBase(
   project: ProjectRecord,
   supplied: string | undefined,
+  ignoreMatcherCache: ProjectIgnoreMatcherCache,
 ): Promise<WalkPath> {
   try {
     return {
       resolved: await resolveProjectPath(project, supplied, {
         isDirectory: true,
+        ignoreMatcherCache,
       }),
       visible: true,
     };
@@ -74,6 +78,7 @@ async function resolveWalkBase(
     const resolved = await resolveProjectPath(project, supplied, {
       isDirectory: true,
       skipIgnoreRules: true,
+      ignoreMatcherCache,
     });
     const details = await stat(resolved.absolutePath);
     if (!details.isDirectory()) throw error;
@@ -85,11 +90,13 @@ async function resolveWalkCandidate(
   project: ProjectRecord,
   relativePath: string,
   isDirectory: boolean,
+  ignoreMatcherCache: ProjectIgnoreMatcherCache,
 ): Promise<WalkPath | undefined> {
   try {
     return {
       resolved: await resolveProjectPath(project, relativePath, {
         isDirectory,
+        ignoreMatcherCache,
       }),
       visible: true,
     };
@@ -104,6 +111,7 @@ async function resolveWalkCandidate(
           resolved: await resolveProjectPath(project, relativePath, {
             isDirectory: true,
             skipIgnoreRules: true,
+            ignoreMatcherCache,
           }),
           visible: false,
         };
@@ -148,7 +156,12 @@ export async function listFiles(
     1,
     MAX_ENTRIES,
   );
-  const baseWalkPath = await resolveWalkBase(project, options.path);
+  const ignoreMatcherCache = createProjectIgnoreMatcherCache();
+  const baseWalkPath = await resolveWalkBase(
+    project,
+    options.path,
+    ignoreMatcherCache,
+  );
   const base = baseWalkPath.resolved;
   const baseInfo = await stat(base.absolutePath);
   if (!baseInfo.isDirectory())
@@ -188,6 +201,7 @@ export async function listFiles(
         project,
         relative,
         child.isDirectory() || child.isSymbolicLink(),
+        ignoreMatcherCache,
       );
       if (!candidate) continue;
       const { resolved } = candidate;
@@ -241,8 +255,13 @@ async function collectFiles(
   startPath: string,
   globMatcher: ((value: string) => boolean) | undefined,
   options: { includeHidden?: boolean } = {},
+  ignoreMatcherCache = createProjectIgnoreMatcherCache(),
 ): Promise<{ files: string[]; truncated: boolean }> {
-  const baseWalkPath = await resolveWalkBase(project, startPath);
+  const baseWalkPath = await resolveWalkBase(
+    project,
+    startPath,
+    ignoreMatcherCache,
+  );
   const base = baseWalkPath.resolved;
   const details = await stat(base.absolutePath);
   if (details.isFile())
@@ -299,6 +318,7 @@ async function collectFiles(
         project,
         relative,
         child.isDirectory() || child.isSymbolicLink(),
+        ignoreMatcherCache,
       );
       if (!walkPath) continue;
       const { resolved: candidate } = walkPath;
@@ -341,10 +361,17 @@ async function collectFiles(
 export async function collectProjectFiles(
   project: ProjectRecord,
   startPath = ".",
+  ignoreMatcherCache = createProjectIgnoreMatcherCache(),
 ): Promise<{ files: string[]; truncated: boolean }> {
-  return await collectFiles(project, startPath, undefined, {
-    includeHidden: true,
-  });
+  return await collectFiles(
+    project,
+    startPath,
+    undefined,
+    {
+      includeHidden: true,
+    },
+    ignoreMatcherCache,
+  );
 }
 
 function contextFor(
@@ -704,7 +731,12 @@ export async function searchFiles(
       );
     }
   }
-  const requestedWalkPath = await resolveWalkBase(project, options.path ?? ".");
+  const ignoreMatcherCache = createProjectIgnoreMatcherCache();
+  const requestedWalkPath = await resolveWalkBase(
+    project,
+    options.path ?? ".",
+    ignoreMatcherCache,
+  );
   const requestedPath = requestedWalkPath.resolved;
   const requestedDetails = await stat(requestedPath.absolutePath);
   if (
@@ -723,7 +755,13 @@ export async function searchFiles(
     });
     if (ripgrep) return ripgrep;
   }
-  const collected = await collectFiles(project, options.path ?? ".", matcher);
+  const collected = await collectFiles(
+    project,
+    options.path ?? ".",
+    matcher,
+    {},
+    ignoreMatcherCache,
+  );
   const files = collected.files;
   const loaded: Array<{ path: string; lines: string[]; truncated: boolean }> =
     [];

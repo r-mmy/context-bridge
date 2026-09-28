@@ -15,10 +15,15 @@ import {
   PINNED_CODEX_VERSION,
   type CodexRuntime,
 } from "../../src/agents/codex/runtime.js";
-import { tryAcquireProjectWriterLock } from "../../src/locks/file-lock.js";
+import {
+  tryAcquireProjectWriterLock,
+  type FileLockHandle,
+} from "../../src/locks/file-lock.js";
 import {
   disableProjectAuthorization,
   enableProjectAuthorization,
+  addAgentProfile,
+  setProjectAllowedProfiles,
 } from "../../src/agents/policy.js";
 import { getTaskPath } from "../../src/config/paths.js";
 import { ContextBridgeError } from "../../src/security/errors.js";
@@ -179,6 +184,18 @@ async function waitForExecutionIdle(
   }
 }
 
+async function waitForProjectWriterLock(
+  project: ProjectRecord,
+): Promise<FileLockHandle> {
+  const deadline = Date.now() + 10_000;
+  while (Date.now() <= deadline) {
+    const lock = await tryAcquireProjectWriterLock(project.root);
+    if (lock) return lock;
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error("project writer lock did not become available");
+}
+
 async function getOnlyStoredTask(harness: Harness): Promise<TaskRecord> {
   const tasks = await harness.runtime.manager.listTasks();
   expect(tasks).toHaveLength(1);
@@ -192,9 +209,8 @@ async function expectWriterReleased(
   project: ProjectRecord,
 ): Promise<void> {
   expect(harness.service.activeCount).toBe(0);
-  const lock = await tryAcquireProjectWriterLock(project.root);
-  expect(lock).not.toBeNull();
-  await lock?.release();
+  const lock = await waitForProjectWriterLock(project);
+  await lock.release();
 }
 
 async function expectPreAcceptanceFailure(
@@ -370,11 +386,207 @@ describe("internal controlled Codex execution", () => {
       networkDisabled: true,
       excludesTemp: true,
       excludesSlashTmp: true,
+      collaborationMode: "default",
+      collaborationModel: "gpt-6-luna",
+      collaborationEffort: "max",
       defaultMode: true,
       oneTextInput: true,
       model: "gpt-6-luna",
       effort: "max",
     });
+  });
+
+  it("continues the same unloaded thread with a fresh baseline, idempotent replay, and Plan mode", async () => {
+    const harness = await createHarness("normal");
+    const project = await registerGitProject(harness, "continuation-project");
+    const started = await harness.service.startTask({
+      project_id: project.id,
+      prompt: "Set the value to beta.",
+    });
+    const first = await waitForTerminal(harness.runtime, started.task_id);
+    expect(first.state).toBe("completed");
+    await waitForExecutionIdle(harness.service);
+    const threadId = first.private_thread_id;
+    expect(threadId).toMatch(/^fake-thread-/);
+
+    await writeFile(path.join(project.root, "value.txt"), "beta\n", "utf8");
+    const continueInput = {
+      task_id: started.task_id,
+      prompt: "Use the prior turn's value and change beta to gamma.",
+      request_id: "same-thread-continuation",
+    };
+    const secondAllocation = await harness.service.continueTask(continueInput);
+    expect(secondAllocation).toMatchObject({ turn_number: 2, replayed: false });
+    const second = await waitForTerminal(harness.runtime, started.task_id);
+    expect(second.turn_count).toBe(2);
+    expect(second.turns[1]?.git_baseline).toMatchObject({
+      modified: 1,
+      staged: 0,
+      deleted: 0,
+      untracked: 0,
+    });
+    expect(second.turns[1]?.prompt_preview).toBe(continueInput.prompt);
+    expect(second.turns[1]?.prompt_sha256).toBe(
+      createHash("sha256").update(continueInput.prompt, "utf8").digest("hex"),
+    );
+    await waitForExecutionIdle(harness.service);
+
+    const beforeReplay = await traceMethods(harness);
+    await expect(harness.service.continueTask(continueInput)).resolves.toEqual({
+      ...secondAllocation,
+      replayed: true,
+    });
+    await expect(
+      harness.service.continueTask({
+        ...continueInput,
+        prompt: "A changed continuation must conflict.",
+      }),
+    ).rejects.toMatchObject({ code: "request_id_conflict" });
+    expect(await traceMethods(harness)).toEqual(beforeReplay);
+
+    await writeFile(path.join(project.root, "value.txt"), "gamma\n", "utf8");
+    const thirdAllocation = await harness.service.continueTask({
+      task_id: started.task_id,
+      prompt: "The previous turn set gamma; create a Plan for the next step.",
+      mode: "plan",
+    });
+    expect(thirdAllocation).toMatchObject({ turn_number: 3, replayed: false });
+    const third = await waitForTerminal(harness.runtime, started.task_id);
+    expect(third.state).toBe("completed");
+    expect(third.turns[2]?.mode).toBe("plan");
+    expect(third.turns[2]?.git_baseline?.modified).toBe(1);
+    await waitForExecutionIdle(harness.service);
+
+    const entries = (await readFile(harness.tracePath, "utf8"))
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    const methods = entries.filter((entry) => entry.method);
+    const starts = methods.filter((entry) => entry.method === "thread/start");
+    const resumes = methods.filter((entry) => entry.method === "thread/resume");
+    const turnStarts = methods.filter((entry) => entry.method === "turn/start");
+    const names = methods.filter((entry) => entry.method === "thread/name/set");
+    const releases = methods.filter(
+      (entry) => entry.method === "thread/unsubscribe",
+    );
+    expect(starts).toHaveLength(1);
+    expect(resumes).toHaveLength(2);
+    expect(turnStarts).toHaveLength(3);
+    expect(names).toHaveLength(1);
+    expect(releases).toHaveLength(3);
+    for (const entry of [...resumes, ...turnStarts]) {
+      expect((entry.params as { threadId?: string }).threadId).toBe(threadId);
+    }
+    expect(resumes[0]?.params).toMatchObject({
+      threadId,
+      cwd: project.root,
+      runtimeWorkspaceRoots: [project.root],
+      approvalPolicy: "never",
+      sandbox: "workspace-write",
+      model: "gpt-6-luna",
+      excludeTurns: true,
+    });
+    expect(
+      entries
+        .filter((entry) => entry.kind === "thread-resume-security-check")
+        .every((entry) =>
+          Object.entries({
+            exactStoredThread: true,
+            oneRuntimeRoot: true,
+            cwdMatchesRoot: true,
+            approvalNever: true,
+            workspaceWrite: true,
+            excludesTurns: true,
+          }).every(([key, value]) => entry[key] === value),
+        ),
+    ).toBe(true);
+    expect(
+      entries
+        .filter((entry) => entry.kind === "execution-security-check")
+        .map((entry) => entry.collaborationMode),
+    ).toEqual(["default", "default", "plan"]);
+    expect(
+      entries
+        .filter((entry) => entry.kind === "execution-security-check")
+        .every((entry) =>
+          [
+            entry.oneRuntimeRoot,
+            entry.cwdMatchesRoot,
+            entry.oneWritableRoot,
+            entry.writableRootMatches,
+            entry.approvalNever,
+            entry.networkDisabled,
+            entry.excludesTemp,
+            entry.excludesSlashTmp,
+          ].every(Boolean),
+        ),
+    ).toBe(true);
+    await expectWriterReleased(harness, project);
+  });
+
+  it.each([
+    "resume-wrong-cwd",
+    "resume-missing-cwd",
+    "resume-wrong-roots",
+    "resume-missing-roots",
+  ])("does not start a turn when thread/resume returns %s", async (mode) => {
+    const harness = await createHarness(mode);
+    const project = await registerGitProject(harness, `resume-${mode}`);
+    const started = await harness.service.startTask({
+      project_id: project.id,
+      prompt: "Complete before testing resume binding.",
+    });
+    await waitForTerminal(harness.runtime, started.task_id);
+    await waitForExecutionIdle(harness.service);
+
+    await expect(
+      harness.service.continueTask({
+        task_id: started.task_id,
+        prompt: "This must not run under a mismatched root.",
+      }),
+    ).rejects.toMatchObject({ code: "app_server_incompatible" });
+    const record = await harness.runtime.manager.getTask(started.task_id);
+    expect(record.state).toBe("failed");
+    expect(record.turn_count).toBe(2);
+    const methods = await traceMethods(harness);
+    expect(methods.filter((method) => method === "thread/start")).toHaveLength(
+      1,
+    );
+    expect(methods.filter((method) => method === "thread/resume")).toHaveLength(
+      1,
+    );
+    expect(methods.filter((method) => method === "turn/start")).toHaveLength(1);
+    expect(
+      methods.filter((method) => method === "thread/unsubscribe"),
+    ).toHaveLength(2);
+    await expectWriterReleased(harness, project);
+  });
+
+  it("starts initial Plan turns with the pinned collaboration mode and unchanged sandbox", async () => {
+    const harness = await createHarness("normal");
+    const project = await registerGitProject(harness, "plan-start-project");
+    const allocation = await harness.service.startTask({
+      project_id: project.id,
+      prompt: "Make a harmless plan only.",
+      mode: "plan",
+    });
+    const record = await waitForTerminal(harness.runtime, allocation.task_id);
+    expect(record.turns[0]?.mode).toBe("plan");
+    const security = (await readFile(harness.tracePath, "utf8"))
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as Record<string, unknown>)
+      .find((entry) => entry.kind === "execution-security-check");
+    expect(security).toMatchObject({
+      collaborationMode: "plan",
+      collaborationModel: "gpt-6-luna",
+      collaborationEffort: "max",
+      networkDisabled: true,
+      approvalNever: true,
+      excludesTemp: true,
+      excludesSlashTmp: true,
+    });
+    await waitForExecutionIdle(harness.service);
   });
 
   it("captures filtered dirty counts and a null HEAD for an unborn repository", async () => {
@@ -980,15 +1192,250 @@ describe("internal controlled Codex execution", () => {
     expect(harness.service.activeCount).toBe(0);
   });
 
+  it("rejects continuation when the durable thread binding is missing", async () => {
+    const harness = await createHarness("normal");
+    const project = await registerGitProject(harness, "missing-thread-project");
+    const started = await harness.service.startTask({
+      project_id: project.id,
+      prompt: "Create a completed task before removing its private binding.",
+    });
+    await waitForTerminal(harness.runtime, started.task_id);
+    await waitForExecutionIdle(harness.service);
+    const record = await harness.runtime.manager.getTask(started.task_id);
+    record.private_thread_id = null;
+    await writeFile(
+      getTaskPath(started.task_id),
+      JSON.stringify(record) + "\n",
+      "utf8",
+    );
+
+    await expect(
+      harness.service.continueTask({
+        task_id: started.task_id,
+        prompt: "This continuation has no private thread proof.",
+      }),
+    ).rejects.toMatchObject({ code: "task_state_conflict" });
+    expect(await traceMethods(harness)).not.toContain("thread/resume");
+    await expectWriterReleased(harness, project);
+  });
+
+  it("requires current enabled authorization and the same registration before continuation", async () => {
+    const disabled = await createHarness("normal");
+    const disabledProject = await registerGitProject(
+      disabled,
+      "disabled-continuation-project",
+    );
+    const disabledTask = await disabled.service.startTask({
+      project_id: disabledProject.id,
+      prompt: "Create a terminal task before disabling authorization.",
+    });
+    await waitForTerminal(disabled.runtime, disabledTask.task_id);
+    await waitForExecutionIdle(disabled.service);
+    await disableProjectAuthorization(disabledProject);
+    await expect(
+      disabled.service.continueTask({
+        task_id: disabledTask.task_id,
+        prompt: "Authorization is now disabled.",
+      }),
+    ).rejects.toMatchObject({ code: "agent_disabled" });
+    expect(await traceMethods(disabled)).not.toContain("thread/resume");
+
+    const stale = await createHarness("normal");
+    const staleProject = await registerGitProject(
+      stale,
+      "stale-continuation-project",
+    );
+    const staleTask = await stale.service.startTask({
+      project_id: staleProject.id,
+      prompt: "Create a terminal task before re-registration.",
+    });
+    await waitForTerminal(stale.runtime, staleTask.task_id);
+    await waitForExecutionIdle(stale.service);
+    await removeProject(staleProject.id);
+    const replacement = await addProject(staleProject.root);
+    stale.projects.push(replacement);
+    await expect(
+      stale.service.continueTask({
+        task_id: staleTask.task_id,
+        prompt: "The task belongs to an older registration.",
+      }),
+    ).rejects.toMatchObject({ code: "task_registration_stale" });
+    expect(await traceMethods(stale)).not.toContain("thread/resume");
+  });
+
+  it("reuses project writer exclusion for continuation", async () => {
+    const harness = await createHarness("normal");
+    const project = await registerGitProject(
+      harness,
+      "busy-continuation-project",
+    );
+    const started = await harness.service.startTask({
+      project_id: project.id,
+      prompt: "Create a terminal task before taking its writer lock.",
+    });
+    await waitForTerminal(harness.runtime, started.task_id);
+    await waitForExecutionIdle(harness.service);
+    const lock = await waitForProjectWriterLock(project);
+    try {
+      await expect(
+        harness.service.continueTask({
+          task_id: started.task_id,
+          prompt: "A second writer holds this project.",
+        }),
+      ).rejects.toMatchObject({ code: "project_busy" });
+    } finally {
+      await lock?.release();
+    }
+    expect(await traceMethods(harness)).not.toContain("thread/resume");
+  });
+
+  it("rejects continuation when the task requires local action", async () => {
+    const harness = await createHarness("normal");
+    const project = await registerGitProject(
+      harness,
+      "local-action-continuation-project",
+    );
+    const started = await harness.service.startTask({
+      project_id: project.id,
+      prompt: "Create a terminal task before requiring local action.",
+    });
+    await waitForTerminal(harness.runtime, started.task_id);
+    await waitForExecutionIdle(harness.service);
+    const record = await harness.runtime.manager.getTask(started.task_id);
+    record.state = "failed";
+    const lastTurn = record.turns.at(-1);
+    if (!lastTurn) throw new Error("expected the failed task turn");
+    lastTurn.state = "failed";
+    record.safe_error = { code: "secret_input_requires_local_action" };
+    record.local_action_required = true;
+    await writeFile(
+      getTaskPath(started.task_id),
+      JSON.stringify(record) + "\n",
+      "utf8",
+    );
+
+    await expect(
+      harness.service.continueTask({
+        task_id: started.task_id,
+        prompt: "Do not continue while local action is required.",
+      }),
+    ).rejects.toMatchObject({ code: "task_state_conflict" });
+    expect(await traceMethods(harness)).not.toContain("thread/resume");
+    await expectWriterReleased(harness, project);
+  });
+
+  it("inherits and overrides only currently allowed continuation profiles", async () => {
+    const harness = await createHarness("normal");
+    const project = await registerGitProject(
+      harness,
+      "profile-continuation-project",
+    );
+    await addAgentProfile("codex-sol-high", {
+      model_id: "gpt-6-sol",
+      reasoning_effort: "high",
+    });
+    await setProjectAllowedProfiles(
+      project,
+      ["luna-max", "codex-sol-high"],
+      "luna-max",
+    );
+    const started = await harness.service.startTask({
+      project_id: project.id,
+      prompt: "Create a terminal task with the inherited profile.",
+    });
+    await waitForTerminal(harness.runtime, started.task_id);
+    await waitForExecutionIdle(harness.service);
+
+    const inherited = await harness.service.continueTask({
+      task_id: started.task_id,
+      prompt: "Continue with the inherited profile.",
+    });
+    expect(inherited.turn_number).toBe(2);
+    expect(
+      (await waitForTerminal(harness.runtime, started.task_id)).turns[1],
+    ).toMatchObject({ profile: "luna-max", model_id: "gpt-6-luna" });
+    await waitForExecutionIdle(harness.service);
+
+    const overridden = await harness.service.continueTask({
+      task_id: started.task_id,
+      prompt: "Continue with the explicit allowed profile.",
+      profile: "codex-sol-high",
+    });
+    expect(overridden.turn_number).toBe(3);
+    expect(
+      (await waitForTerminal(harness.runtime, started.task_id)).turns[2],
+    ).toMatchObject({ profile: "codex-sol-high", model_id: "gpt-6-sol" });
+    await waitForExecutionIdle(harness.service);
+
+    await expect(
+      harness.service.continueTask({
+        task_id: started.task_id,
+        prompt: "A profile outside current authorization must fail.",
+        profile: "not-allowed",
+      }),
+    ).rejects.toMatchObject({ code: "profile_not_allowed" });
+    expect(
+      (await traceMethods(harness)).filter(
+        (method) => method === "thread/resume",
+      ),
+    ).toHaveLength(2);
+    await expectWriterReleased(harness, project);
+  });
+
+  it("applies the global active-turn cap to continuation allocations", async () => {
+    const harness = await createHarness("delayed-turn");
+    const terminalProject = await registerGitProject(
+      harness,
+      "continuation-cap-terminal",
+    );
+    const terminalTask = await harness.service.startTask({
+      project_id: terminalProject.id,
+      prompt: "Create a task that can be continued after cancellation.",
+    });
+    await harness.service.cancelTask(terminalTask.task_id);
+    const activeProjects = await Promise.all(
+      ["one", "two", "three", "four"].map((name) =>
+        registerGitProject(harness, `continuation-cap-${name}`),
+      ),
+    );
+    // This test verifies the active-turn cap, not concurrent config-lock
+    // acquisition. Avoid queuing four Git/authorization checks on that lock.
+    const activeTasks = [];
+    for (const activeProject of activeProjects) {
+      activeTasks.push(
+        await harness.service.startTask({
+          project_id: activeProject.id,
+          prompt: "Hold one active turn for the continuation capacity check.",
+        }),
+      );
+    }
+    expect(harness.service.activeCount).toBe(4);
+    await expect(
+      harness.service.continueTask({
+        task_id: terminalTask.task_id,
+        prompt: "The fifth active turn must be rejected.",
+      }),
+    ).rejects.toMatchObject({ code: "agent_capacity" });
+    expect(await traceMethods(harness)).not.toContain("thread/resume");
+    await Promise.all(
+      activeTasks.map((activeTask) =>
+        harness.service.cancelTask(activeTask.task_id),
+      ),
+    );
+    await expectWriterReleased(harness, terminalProject);
+  });
+
   it("fails an active turn on an unexpected correlated server request without saving its payload", async () => {
     const harness = await createHarness("execution-server-request");
     const project = await registerGitProject(harness, "server-request-project");
     const allocation = await harness.service.startTask({
       project_id: project.id,
       prompt: "Do not ask for more input.",
+      mode: "plan",
     });
     const record = await waitForTerminal(harness.runtime, allocation.task_id);
     expect(record.state).toBe("failed");
+    expect(record.turns[0]?.mode).toBe("plan");
     expect(JSON.stringify(record)).not.toContain("private question text");
     expect(JSON.stringify(record)).not.toContain(
       "ephemeral-private-server-request-id",

@@ -506,6 +506,7 @@ export class TaskManager {
 
   async appendTurnIntent(
     input: AppendTurnIntentInput,
+    requestLockHeld = false,
   ): Promise<TaskAllocation> {
     this.assertOwner();
     const parsed = ContinueIntentSchema.safeParse(input);
@@ -518,40 +519,8 @@ export class TaskManager {
       ? hashRequestId(intent.request_id)
       : undefined;
     const operation = async (): Promise<TaskAllocation> => {
-      const existing = requestHash
-        ? this.idempotency.get(requestHash)
-        : undefined;
-      if (existing) {
-        if (
-          existing.operation !== "continue" ||
-          existing.task_id !== intent.task_id
-        ) {
-          throw new TaskError("request_id_conflict");
-        }
-        const record = await this.store.read(existing.task_id);
-        const turn = record.turns[existing.turn_number - 1];
-        if (!turn) throw new TaskError("task_store_error");
-        const prompt = this.summarizeIntentPrompt(intent.prompt);
-        const profile = intent.profile ?? turn.profile;
-        const modelId = intent.model_id ?? turn.model_id;
-        const mode = intent.mode ?? "default";
-        const payloadHash = this.continuePayloadHash(
-          record,
-          existing.turn_number,
-          prompt.prompt_sha256,
-          profile,
-          modelId,
-          mode,
-        );
-        if (existing.payload_hash !== payloadHash) {
-          throw new TaskError("request_id_conflict");
-        }
-        return {
-          task_id: existing.task_id,
-          turn_number: existing.turn_number,
-          replayed: true,
-        };
-      }
+      const replay = await this.findContinueReplayForIntent(intent);
+      if (replay) return replay;
 
       return this.withKeyQueue(this.taskQueues, intent.task_id, async () => {
         const record = await this.store.read(intent.task_id);
@@ -639,9 +608,57 @@ export class TaskManager {
         };
       });
     };
-    return requestHash
+    return requestHash && !requestLockHeld
       ? this.withKeyQueue(this.requestQueues, requestHash, operation)
       : operation();
+  }
+
+  async findContinueReplay(
+    input: AppendTurnIntentInput,
+  ): Promise<TaskAllocation | undefined> {
+    this.assertOwner();
+    const parsed = ContinueIntentSchema.safeParse(input);
+    if (!parsed.success) throw new TaskError("task_invalid_input");
+    const intent = {
+      ...parsed.data,
+      task_id: parsed.data.task_id.toLowerCase(),
+    };
+    if (!intent.request_id) return undefined;
+    return this.findContinueReplayForIntent(intent);
+  }
+
+  private async findContinueReplayForIntent(
+    intent: z.infer<typeof ContinueIntentSchema> & { task_id: string },
+  ): Promise<TaskAllocation | undefined> {
+    if (!intent.request_id) return undefined;
+    const existing = this.idempotency.get(hashRequestId(intent.request_id));
+    if (!existing) return undefined;
+    if (
+      existing.operation !== "continue" ||
+      existing.task_id !== intent.task_id
+    ) {
+      throw new TaskError("request_id_conflict");
+    }
+    const record = await this.store.read(existing.task_id);
+    const turn = record.turns[existing.turn_number - 1];
+    if (!turn) throw new TaskError("task_store_error");
+    const prompt = this.summarizeIntentPrompt(intent.prompt);
+    const payloadHash = this.continuePayloadHash(
+      record,
+      existing.turn_number,
+      prompt.prompt_sha256,
+      intent.profile ?? turn.profile,
+      intent.model_id ?? turn.model_id,
+      intent.mode ?? "default",
+    );
+    if (existing.payload_hash !== payloadHash) {
+      throw new TaskError("request_id_conflict");
+    }
+    return {
+      task_id: existing.task_id,
+      turn_number: existing.turn_number,
+      replayed: true,
+    };
   }
 
   async transitionTurn(

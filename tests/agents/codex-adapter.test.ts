@@ -257,6 +257,60 @@ describe("Codex App Server adapter", () => {
     await harness.adapter.close();
   });
 
+  it("resumes only the requested thread and verifies its effective workspace binding", async () => {
+    const harness = await createHarness("normal");
+    await harness.adapter.start();
+    const threadId = "private-thread-for-resume-test";
+    await expect(
+      harness.adapter.resumeThread({
+        threadId,
+        root: harness.directory,
+        model: "gpt-6-luna",
+      }),
+    ).resolves.toEqual({ threadId });
+    const request = (await readTrace(harness.tracePath)).find(
+      (entry) => entry.method === "thread/resume",
+    );
+    expect(request?.params).toMatchObject({
+      threadId,
+      model: "gpt-6-luna",
+      cwd: harness.directory,
+      runtimeWorkspaceRoots: [harness.directory],
+      approvalPolicy: "never",
+      sandbox: "workspace-write",
+      excludeTurns: true,
+    });
+    await harness.adapter.close();
+  });
+
+  it.each([
+    "resume-wrong-thread",
+    "resume-wrong-model",
+    "resume-wrong-cwd",
+    "resume-missing-cwd",
+    "resume-wrong-roots",
+    "resume-missing-roots",
+    "resume-wrong-approval",
+    "resume-wrong-sandbox",
+  ])("rejects a %s thread/resume response", async (mode) => {
+    const harness = await createHarness(mode);
+    await harness.adapter.start();
+    await expect(
+      harness.adapter.resumeThread({
+        threadId: "private-thread-for-resume-test",
+        root: harness.directory,
+        model: "gpt-6-luna",
+      }),
+    ).rejects.toMatchObject({ code: "app_server_incompatible" });
+    const methods = (await readTrace(harness.tracePath))
+      .filter((entry) => entry.method)
+      .map((entry) => entry.method);
+    expect(methods).toContain("thread/resume");
+    expect(methods).toContain("thread/unsubscribe");
+    expect(methods).not.toContain("turn/start");
+    await harness.adapter.close();
+  });
+
   it("passes only the platform allowlist and derives CODEX_HOME without inheriting secrets", async () => {
     const harness = await createHarness();
     await harness.adapter.start();

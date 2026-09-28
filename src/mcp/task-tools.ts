@@ -55,6 +55,16 @@ export const TaskStartInputSchema = z
   })
   .strict();
 
+export const TaskContinueInputSchema = z
+  .object({
+    task_id: TASK_ID,
+    prompt: PROMPT,
+    profile: PROFILE.optional(),
+    mode: z.enum(["default", "plan"]).default("default"),
+    request_id: REQUEST_ID.optional(),
+  })
+  .strict();
+
 export const TaskGetInputSchema = z
   .object({
     task_id: TASK_ID,
@@ -642,7 +652,7 @@ export function registerTaskTools(server: McpServer, host: TaskToolHost): void {
     "task_start",
     {
       description:
-        "Start one default-mode Codex task in a locally agent-enabled registered Git project. The result means the turn was accepted, not completed; use task_get to inspect progress and review actual edits with git_status and git_diff.",
+        "Start one default- or Plan-mode Codex task in a locally agent-enabled registered Git project. The result means the turn was accepted, not completed; use task_get to inspect progress and review actual edits with git_status and git_diff.",
       inputSchema: TaskStartInputSchema,
       outputSchema: TaskAcceptedOutputSchema,
       annotations: START_TASK,
@@ -652,6 +662,38 @@ export function registerTaskTools(server: McpServer, host: TaskToolHost): void {
         const record = await host.startTask(input);
         const turn = record.turns.find(
           (candidate) => candidate.turn_number === 1,
+        );
+        if (!turn) throw new TaskError("task_store_error");
+        return {
+          task_id: record.task_id,
+          project_id: record.project_id,
+          display_name: record.display_name,
+          state: record.state,
+          turn_number: turn.turn_number,
+          profile: turn.profile,
+          mode: turn.mode,
+          created_at: record.created_at,
+          updated_at: record.updated_at,
+        };
+      }),
+  );
+
+  server.registerTool(
+    "task_continue",
+    {
+      description:
+        "Continue a terminal task in its same Codex thread after verifying the current registered project root and authorization. The result means the new turn was accepted, not completed; use task_get to inspect progress and review actual edits with git_status and git_diff.",
+      inputSchema: TaskContinueInputSchema,
+      outputSchema: TaskAcceptedOutputSchema,
+      annotations: START_TASK,
+    },
+    async (input) =>
+      runTaskTool(TaskAcceptedOutputSchema, async () => {
+        const result = await host.continueTask(input);
+        const record = result.record;
+        const turn = record.turns.find(
+          (candidate) =>
+            candidate.turn_number === result.allocation.turn_number,
         );
         if (!turn) throw new TaskError("task_store_error");
         return {

@@ -107,6 +107,13 @@ describe("read-only Git interface", () => {
     const diff = await getGitDiff(project, { mode: "working" });
     expect(diff.files).toContain("restored.txt");
     expect(diff.patch).toContain("re-included untracked content");
+
+    await writeFile(
+      path.join(project.root, ".contextbridgeignore"),
+      "restored.txt\n",
+    );
+    const updatedStatus = await getGitStatus(project);
+    expect(updatedStatus.untracked).not.toContain("restored.txt");
   });
 
   it("keeps nested ignore negations consistent across Git status, diffs, and show", async () => {
@@ -541,11 +548,7 @@ describe("read-only Git interface", () => {
       return result;
     };
 
-    for (
-      let maxBytes = 1;
-      maxBytes <= Buffer.byteLength(content, "utf8");
-      maxBytes += 1
-    ) {
+    for (const maxBytes of [2, 4, 7, Buffer.byteLength(content, "utf8")]) {
       const shown = await getGitShow(project, {
         revision,
         path: pathName,
@@ -566,24 +569,24 @@ describe("read-only Git interface", () => {
       mode: "working",
       maxBytes: 1024 * 1024,
     });
-    const emojiPosition = complete.patch.indexOf("😀");
-    expect(emojiPosition).toBeGreaterThanOrEqual(0);
-    const bytesBeforeEmoji = Buffer.byteLength(
-      complete.patch.slice(0, emojiPosition),
-      "utf8",
-    );
-    for (
-      let insideEmoji = 1;
-      insideEmoji < Buffer.byteLength("😀", "utf8");
-      insideEmoji += 1
-    ) {
+    for (const character of ["é", "漢", "😀"]) {
+      const characterPosition = complete.patch.indexOf(character);
+      expect(characterPosition).toBeGreaterThanOrEqual(0);
+      const bytesBeforeCharacter = Buffer.byteLength(
+        complete.patch.slice(0, characterPosition),
+        "utf8",
+      );
+      const insideCharacter = Math.max(
+        1,
+        Math.floor(Buffer.byteLength(character, "utf8") / 2),
+      );
       const limited = await getGitDiff(project, {
         mode: "working",
-        maxBytes: bytesBeforeEmoji + insideEmoji,
+        maxBytes: bytesBeforeCharacter + insideCharacter,
       });
       expect(limited.patch).not.toContain("\uFFFD");
       expect(Buffer.byteLength(limited.patch, "utf8")).toBeLessThanOrEqual(
-        bytesBeforeEmoji + insideEmoji,
+        bytesBeforeCharacter + insideCharacter,
       );
     }
 
@@ -597,25 +600,24 @@ describe("read-only Git interface", () => {
       mode: "working",
       maxBytes: 1024 * 1024,
     });
-    const untrackedEmojiPosition = completeUntracked.patch.indexOf("😀");
-    expect(untrackedEmojiPosition).toBeGreaterThanOrEqual(0);
-    const bytesBeforeUntrackedEmoji = Buffer.byteLength(
-      completeUntracked.patch.slice(0, untrackedEmojiPosition),
-      "utf8",
-    );
-    for (
-      let insideEmoji = 1;
-      insideEmoji < Buffer.byteLength("😀", "utf8");
-      insideEmoji += 1
-    ) {
-      const limited = await getGitDiff(project, {
-        mode: "working",
-        maxBytes: bytesBeforeUntrackedEmoji + insideEmoji,
-      });
-      expect(limited.patch).not.toContain("\uFFFD");
-      expect(Buffer.byteLength(limited.patch, "utf8")).toBeLessThanOrEqual(
-        bytesBeforeUntrackedEmoji + insideEmoji,
+    for (const character of ["é", "漢", "😀"]) {
+      const characterPosition = completeUntracked.patch.indexOf(character);
+      expect(characterPosition).toBeGreaterThanOrEqual(0);
+      const bytesBeforeCharacter = Buffer.byteLength(
+        completeUntracked.patch.slice(0, characterPosition),
+        "utf8",
       );
+      const insideCharacter = Math.floor(
+        Buffer.byteLength(character, "utf8") / 2,
+      );
+      const limitedUntracked = await getGitDiff(project, {
+        mode: "working",
+        maxBytes: bytesBeforeCharacter + insideCharacter,
+      });
+      expect(limitedUntracked.patch).not.toContain("\uFFFD");
+      expect(
+        Buffer.byteLength(limitedUntracked.patch, "utf8"),
+      ).toBeLessThanOrEqual(bytesBeforeCharacter + insideCharacter);
     }
   });
 

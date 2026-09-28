@@ -316,6 +316,68 @@ function processRequest(request) {
     return;
   }
 
+  if (request.method === "thread/resume") {
+    const params = request.params ?? {};
+    const requestedRoots = params.runtimeWorkspaceRoots;
+    const result = {
+      thread: { id: params.threadId },
+      model: params.model,
+      modelProvider: "openai",
+      serviceTier: null,
+      disabledPluginIds: [],
+      cwd: params.cwd,
+      runtimeWorkspaceRoots: requestedRoots,
+      instructionSources: [],
+      approvalPolicy: params.approvalPolicy,
+      approvalsReviewer: null,
+      sandbox: {
+        type: "workspaceWrite",
+        writableRoots: requestedRoots,
+        networkAccess: false,
+        excludeTmpdirEnvVar: true,
+        excludeSlashTmp: true,
+      },
+      activePermissionProfile: null,
+      reasoningEffort: "max",
+      collaborationMode: null,
+      multiAgentMode: "explicitRequestOnly",
+      initialTurnsPage: null,
+      turnsBackwardsCursor: null,
+      itemsBackwardsCursor: null,
+    };
+    record({
+      kind: "thread-resume-security-check",
+      exactStoredThread: typeof params.threadId === "string",
+      oneRuntimeRoot: requestedRoots?.length === 1,
+      cwdMatchesRoot: params.cwd === requestedRoots?.[0],
+      approvalNever: params.approvalPolicy === "never",
+      workspaceWrite: params.sandbox === "workspace-write",
+      model: params.model,
+      excludesTurns: params.excludeTurns === true,
+    });
+    if (mode === "resume-error") {
+      send({
+        id: request.id,
+        error: { code: -32603, message: "PRIVATE_RESUME_ERROR" },
+      });
+      return;
+    }
+    if (mode === "resume-wrong-thread") result.thread.id = "different-thread";
+    if (mode === "resume-wrong-model") result.model = "gpt-6-sol";
+    if (mode === "resume-wrong-cwd") result.cwd = `${params.cwd}-wrong`;
+    if (mode === "resume-missing-cwd") delete result.cwd;
+    if (mode === "resume-wrong-roots") {
+      result.runtimeWorkspaceRoots = [`${params.cwd}-wrong`];
+    }
+    if (mode === "resume-missing-roots") delete result.runtimeWorkspaceRoots;
+    if (mode === "resume-wrong-approval") result.approvalPolicy = "on-request";
+    if (mode === "resume-wrong-sandbox") {
+      result.sandbox = { type: "dangerFullAccess" };
+    }
+    send({ id: request.id, result });
+    return;
+  }
+
   if (request.method === "turn/start") {
     const params = request.params ?? {};
     const policy = params.sandboxPolicy ?? {};
@@ -331,7 +393,10 @@ function processRequest(request) {
       networkDisabled: policy.networkAccess === false,
       excludesTemp: policy.excludeTmpdirEnvVar === true,
       excludesSlashTmp: policy.excludeSlashTmp === true,
-      defaultMode: !Object.hasOwn(params, "collaborationMode"),
+      collaborationMode: params.collaborationMode?.mode,
+      collaborationModel: params.collaborationMode?.settings?.model,
+      collaborationEffort: params.collaborationMode?.settings?.reasoning_effort,
+      defaultMode: params.collaborationMode?.mode === "default",
       oneTextInput:
         params.input?.length === 1 && params.input[0]?.type === "text",
       model: params.model,

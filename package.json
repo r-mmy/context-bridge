@@ -24,7 +24,7 @@
     "build": "tsc -p tsconfig.json",
     "dev": "tsx src/cli/main.ts",
     "ctxbridge": "tsx src/cli/main.ts",
-    "test": "vitest run --pool=forks --testTimeout=30000",
+    "test": "vitest run --pool=forks --maxWorkers=1 --testTimeout=30000",
     "test:watch": "vitest",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit",
     "lint": "eslint src tests eslint.config.mjs",

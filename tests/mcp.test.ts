@@ -186,6 +186,21 @@ describe.sequential("MCP contract", () => {
           },
         }),
       ).rejects.toThrow("Tool task_start not found");
+      await expect(
+        client.callTool({
+          name: "task_continue",
+          arguments: {
+            task_id: "00000000-0000-4000-8000-000000000000",
+            prompt: "No.",
+          },
+        }),
+      ).rejects.toThrow("Tool task_continue not found");
+      await expect(
+        client.callTool({
+          name: "task_answer",
+          arguments: {},
+        }),
+      ).rejects.toThrow("Tool task_answer not found");
 
       const projects = await client.callTool({
         name: "projects_list",

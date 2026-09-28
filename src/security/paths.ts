@@ -63,6 +63,17 @@ const ALWAYS_EXCLUDED_SEGMENTS = new Set([
 ]);
 const MAX_IGNORE_FILE_BYTES = 256 * 1024;
 
+type IgnoreMatcher = ReturnType<typeof ignore>;
+export type ProjectIgnoreMatcherCache = Map<
+  string,
+  Promise<IgnoreMatcher | undefined>
+>;
+
+/** Cache ignore rules and matchers for one top-level filesystem operation. */
+export function createProjectIgnoreMatcherCache(): ProjectIgnoreMatcherCache {
+  return new Map();
+}
+
 function containsPath(root: string, target: string): boolean {
   const relative = path.relative(root, target);
   if (relative === "") return true;
@@ -306,10 +317,54 @@ async function readRules(
   }
 }
 
+async function loadIgnoreMatcher(
+  projectRoot: string,
+  relativeDirectory: string,
+): Promise<IgnoreMatcher | undefined> {
+  const gitRules = await readRules(
+    projectRoot,
+    relativeDirectory,
+    ".gitignore",
+  );
+  const bridgeRules = await readRules(
+    projectRoot,
+    relativeDirectory,
+    ".contextbridgeignore",
+  );
+  if (!gitRules && !bridgeRules) return undefined;
+  const matcher = ignore();
+  try {
+    if (gitRules) matcher.add(gitRules);
+    if (bridgeRules) matcher.add(bridgeRules);
+  } catch {
+    throw new ContextBridgeError(
+      "invalid_ignore_file",
+      "Project ignore rules contain an invalid pattern.",
+    );
+  }
+  return matcher;
+}
+
+async function getIgnoreMatcher(
+  projectRoot: string,
+  relativeDirectory: string,
+  cache?: ProjectIgnoreMatcherCache,
+): Promise<IgnoreMatcher | undefined> {
+  if (!cache) return await loadIgnoreMatcher(projectRoot, relativeDirectory);
+  const key = `${projectRoot}\0${relativeDirectory}`;
+  let matcher = cache.get(key);
+  if (!matcher) {
+    matcher = loadIgnoreMatcher(projectRoot, relativeDirectory);
+    cache.set(key, matcher);
+  }
+  return await matcher;
+}
+
 async function isIgnored(
   projectRoot: string,
   relativePath: string,
   isDirectory: boolean,
+  cache?: ProjectIgnoreMatcherCache,
 ): Promise<boolean> {
   if (!relativePath) return false;
   const components = relativePath.split("/");
@@ -323,23 +378,8 @@ async function isIgnored(
     const localPath = ancestor
       ? relativePath.slice(ancestor.length + 1)
       : relativePath;
-    const gitRules = await readRules(projectRoot, ancestor, ".gitignore");
-    const bridgeRules = await readRules(
-      projectRoot,
-      ancestor,
-      ".contextbridgeignore",
-    );
-    const matcher = ignore();
-    try {
-      if (gitRules) matcher.add(gitRules);
-      if (bridgeRules) matcher.add(bridgeRules);
-    } catch {
-      throw new ContextBridgeError(
-        "invalid_ignore_file",
-        "Project ignore rules contain an invalid pattern.",
-      );
-    }
-    if (!gitRules && !bridgeRules) continue;
+    const matcher = await getIgnoreMatcher(projectRoot, ancestor, cache);
+    if (!matcher) continue;
     const result = matcher.test(`${localPath}${isDirectory ? "/" : ""}`);
     if (result.ignored) ignored = true;
     else if (result.unignored) ignored = false;
@@ -388,6 +428,7 @@ export async function resolveProjectPath(
     allowMissing?: boolean;
     isDirectory?: boolean;
     skipIgnoreRules?: boolean;
+    ignoreMatcherCache?: ProjectIgnoreMatcherCache;
   } = {},
 ): Promise<ResolvedPath> {
   if (isSensitiveProjectRoot(project.root))
@@ -406,7 +447,12 @@ export async function resolveProjectPath(
     );
   if (
     !options.skipIgnoreRules &&
-    (await isIgnored(project.root, relativePath, options.isDirectory ?? false))
+    (await isIgnored(
+      project.root,
+      relativePath,
+      options.isDirectory ?? false,
+      options.ignoreMatcherCache,
+    ))
   ) {
     throw new ContextBridgeError(
       "path_ignored",
@@ -437,6 +483,7 @@ export async function resolveProjectPath(
         project.root,
         canonicalRelativePath,
         options.isDirectory ?? false,
+        options.ignoreMatcherCache,
       ))
     ) {
       throw new ContextBridgeError(
@@ -469,9 +516,13 @@ export async function resolveProjectPath(
 export async function isProjectPathVisible(
   project: ProjectRecord,
   relativePath: string,
+  ignoreMatcherCache?: ProjectIgnoreMatcherCache,
 ): Promise<boolean> {
   try {
-    await resolveProjectPath(project, relativePath, { allowMissing: true });
+    await resolveProjectPath(project, relativePath, {
+      allowMissing: true,
+      ...(ignoreMatcherCache ? { ignoreMatcherCache } : {}),
+    });
     return true;
   } catch (error) {
     if (

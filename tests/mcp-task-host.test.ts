@@ -38,6 +38,10 @@ describe.sequential("lazy MCP task host", () => {
     let codexStarts = 0;
     const fakeRuntime = {
       manager: {
+        withStartRequestLock: async (
+          _requestId: string | undefined,
+          operation: () => Promise<unknown>,
+        ) => operation(),
         listRegisteredTaskRecordsPage: async () => ({
           records: [],
           truncated: false,
@@ -79,10 +83,10 @@ describe.sequential("lazy MCP task host", () => {
     await expect(
       host.startTask({
         project_id: "sample-project",
-        prompt: "This mode is not available yet.",
+        prompt: "This test has no registered project.",
         mode: "plan",
       }),
-    ).rejects.toMatchObject({ code: "unsupported_task_mode" });
+    ).rejects.toMatchObject({ code: "project_not_found" });
     expect(adapterStarts).toBe(1);
     expect(codexStarts).toBe(0);
     await host.close();

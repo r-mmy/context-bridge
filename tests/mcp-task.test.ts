@@ -20,6 +20,7 @@ import {
   TaskAcceptedOutputSchema,
   TaskCancelOutputSchema,
   TaskGetInputSchema,
+  TaskContinueInputSchema,
   TaskStartInputSchema,
   TasksListInputSchema,
 } from "../src/mcp/task-tools.js";
@@ -141,6 +142,9 @@ class MemoryTaskHost implements TaskToolHost {
   startInput: unknown = undefined;
   startError: unknown = undefined;
   startCalls = 0;
+  continueCalls = 0;
+  continueInput: unknown = undefined;
+  continueError: unknown = undefined;
   cancelCalls = 0;
   cancelGate: Promise<void> | undefined;
   getError: unknown = undefined;
@@ -162,12 +166,6 @@ class MemoryTaskHost implements TaskToolHost {
     this.startCalls += 1;
     this.startInput = input;
     if (this.startError) throw this.startError;
-    if (input.mode === "plan") {
-      throw new ContextBridgeError(
-        "unsupported_task_mode",
-        "raw internal plan-mode detail",
-      );
-    }
     const requestPayload = JSON.stringify({
       project_id: input.project_id,
       prompt: input.prompt,
@@ -184,6 +182,9 @@ class MemoryTaskHost implements TaskToolHost {
       }
     }
     this.record = makeRecord({ state: "running" });
+    const firstTurn = this.record.turns[0];
+    if (firstTurn) firstTurn.mode = input.mode ?? "default";
+    this.record = TaskRecordSchema.parse(this.record);
     if (input.request_id) {
       this.requests.set(input.request_id, {
         payload: requestPayload,
@@ -191,6 +192,59 @@ class MemoryTaskHost implements TaskToolHost {
       });
     }
     return structuredClone(this.record);
+  }
+
+  async continueTask(input: Parameters<TaskToolHost["continueTask"]>[0]) {
+    this.continueCalls += 1;
+    this.continueInput = input;
+    if (this.continueError) throw this.continueError;
+    if (input.task_id !== this.record.task_id)
+      throw new TaskError("task_not_found");
+    const prior = this.record.turns.at(-1);
+    if (!prior) throw new TaskError("task_store_error");
+    const terminalPrior = {
+      ...structuredClone(prior),
+      state: "completed" as const,
+      completed_at: NOW,
+    };
+    const turnNumber = this.record.turn_count + 1;
+    const nextTurn = {
+      ...structuredClone(prior),
+      turn_number: turnNumber,
+      state: "running" as const,
+      mode: input.mode,
+      profile: input.profile ?? this.record.current_profile,
+      model_id: "PRIVATE_MODEL_ID",
+      created_at: NOW,
+      started_at: NOW,
+      completed_at: null,
+      prompt_preview: "PRIVATE_CONTINUATION_PROMPT",
+      prompt_sha256: "e".repeat(64),
+      git_baseline: null,
+      final_response: null,
+      safe_error: null,
+      usage: emptyTurnUsage(),
+    };
+    this.record = TaskRecordSchema.parse({
+      ...this.record,
+      state: "running",
+      current_profile: nextTurn.profile,
+      turn_count: turnNumber,
+      turns: [...this.record.turns.slice(0, -1), terminalPrior, nextTurn],
+      updated_at: NOW,
+      pending_input: null,
+      local_action_required: false,
+      final_response: null,
+      safe_error: null,
+    });
+    return {
+      record: structuredClone(this.record),
+      allocation: {
+        task_id: this.record.task_id,
+        turn_number: turnNumber,
+        replayed: false,
+      },
+    };
   }
 
   async getTask(taskId: string) {
@@ -306,7 +360,7 @@ function textError(result: {
   };
 }
 
-describe("M4B public task MCP façade", () => {
+describe("public task MCP façade", () => {
   it("enforces strict bounded input schemas", () => {
     expect(
       TaskStartInputSchema.safeParse({
@@ -318,6 +372,48 @@ describe("M4B public task MCP façade", () => {
       TaskStartInputSchema.safeParse({
         project_id: "sample-project",
         prompt: "x".repeat(32 * 1024 + 1),
+      }).success,
+    ).toBe(false);
+    expect(
+      TaskContinueInputSchema.safeParse({
+        task_id: randomUUID(),
+        prompt: "x",
+        request_id: "x".repeat(128),
+      }).success,
+    ).toBe(true);
+    expect(
+      TaskContinueInputSchema.safeParse({
+        task_id: randomUUID(),
+        prompt: "x",
+        request_id: "x".repeat(129),
+      }).success,
+    ).toBe(false);
+    expect(
+      TaskContinueInputSchema.safeParse({
+        task_id: randomUUID(),
+        prompt: "x".repeat(32 * 1024 + 1),
+      }).success,
+    ).toBe(false);
+    expect(
+      TaskContinueInputSchema.safeParse({
+        task_id: randomUUID(),
+        prompt: "x".repeat(32 * 1024),
+        mode: "plan",
+      }).success,
+    ).toBe(true);
+    for (const prompt of ["", "\0", "\ud800", "😀".repeat(8_193)]) {
+      expect(
+        TaskContinueInputSchema.safeParse({
+          task_id: randomUUID(),
+          prompt,
+        }).success,
+      ).toBe(false);
+    }
+    expect(
+      TaskContinueInputSchema.safeParse({
+        task_id: randomUUID(),
+        prompt: "x",
+        extra: true,
       }).success,
     ).toBe(false);
     expect(
@@ -369,7 +465,7 @@ describe("M4B public task MCP façade", () => {
     expect(TasksListInputSchema.safeParse({ limit: 101 }).success).toBe(false);
   });
 
-  it("registers thirteen stdio-capable tools with the exact task annotations", async () => {
+  it("registers fourteen stdio-capable tools with the exact task annotations", async () => {
     const host = new MemoryTaskHost();
     await withClient(host, async (client) => {
       const result = await client.listTools();
@@ -384,6 +480,7 @@ describe("M4B public task MCP façade", () => {
         "project_get",
         "projects_list",
         "task_cancel",
+        "task_continue",
         "task_get",
         "task_start",
         "tasks_list",
@@ -394,6 +491,12 @@ describe("M4B public task MCP façade", () => {
         destructiveHint: true,
         openWorldHint: false,
       });
+      expect(tools.get("task_continue")?.annotations).toMatchObject({
+        readOnlyHint: false,
+        destructiveHint: true,
+        openWorldHint: false,
+      });
+      expect(tools.has("task_answer")).toBe(false);
       for (const name of ["task_get", "tasks_list"]) {
         expect(tools.get(name)?.annotations).toMatchObject({
           readOnlyHint: true,
@@ -409,6 +512,49 @@ describe("M4B public task MCP façade", () => {
       expect(tools.get("task_cancel")?.description).toContain(
         "partial workspace edits",
       );
+    });
+  });
+
+  it("continues the requested durable turn and returns only the accepted output fields", async () => {
+    const host = new MemoryTaskHost();
+    const taskId = host.record.task_id;
+    await withClient(host, async (client) => {
+      const result = await client.callTool({
+        name: "task_continue",
+        arguments: {
+          task_id: taskId,
+          prompt: "Now update the dependent value.",
+          mode: "plan",
+        },
+      });
+      expect(result.isError, JSON.stringify(result)).not.toBe(true);
+      const output =
+        structured<z.infer<typeof TaskAcceptedOutputSchema>>(result);
+      expect(output).toMatchObject({
+        task_id: taskId,
+        turn_number: 2,
+        profile: "luna-max",
+        mode: "plan",
+      });
+      expect(host.continueCalls).toBe(1);
+      expect(host.continueInput).toMatchObject({
+        task_id: taskId,
+        prompt: "Now update the dependent value.",
+        mode: "plan",
+      });
+      expect(Object.keys(output).sort()).toEqual([
+        "created_at",
+        "display_name",
+        "mode",
+        "profile",
+        "project_id",
+        "state",
+        "task_id",
+        "turn_number",
+        "updated_at",
+      ]);
+      expect(JSON.stringify(result)).not.toContain("PRIVATE_THREAD_ID");
+      expect(JSON.stringify(result)).not.toContain("PRIVATE_MODEL_ID");
     });
   });
 
@@ -666,26 +812,9 @@ describe("M4B public task MCP façade", () => {
     });
   });
 
-  it("sanitizes mode and task errors and returns only the cancellation state", async () => {
+  it("sanitizes task errors and returns only the cancellation state", async () => {
     const host = new MemoryTaskHost();
     await withClient(host, async (client) => {
-      const unsupported = await client.callTool({
-        name: "task_start",
-        arguments: {
-          project_id: "sample-project",
-          prompt: "Do not start a Plan turn.",
-          mode: "plan",
-        },
-      });
-      expect(unsupported.isError).toBe(true);
-      expect(textError(unsupported)).toEqual({
-        code: "unsupported_task_mode",
-        message:
-          "Only the default Codex execution mode is available in this milestone.",
-        retryable: false,
-      });
-      expect(JSON.stringify(unsupported)).not.toContain("raw internal");
-
       const cancelled = await client.callTool({
         name: "task_cancel",
         arguments: { task_id: host.record.task_id },

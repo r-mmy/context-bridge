@@ -12,9 +12,10 @@ import { GitRepository, isGitRepository } from "../git/run.js";
 import { authorizationMatchesProject, readAgentPolicy } from "./policy.js";
 import { getProject, type ProjectRecord } from "../projects/registry.js";
 import { ContextBridgeError } from "../security/errors.js";
-import { isAgentAdapterError } from "./errors.js";
+import { AgentAdapterError, isAgentAdapterError } from "./errors.js";
 import { isTaskError, TaskError } from "../tasks/errors.js";
 import type {
+  AppendTurnIntentInput,
   TaskAllocation,
   CreateTaskIntentInput,
 } from "../tasks/manager.js";
@@ -49,6 +50,28 @@ const START_INPUT_SCHEMA = z
 
 export type StartExecutionInput = z.infer<typeof START_INPUT_SCHEMA>;
 
+const CONTINUE_INPUT_SCHEMA = z
+  .object({
+    task_id: z.string().uuid(),
+    prompt: z.string(),
+    profile: z
+      .string()
+      .min(1)
+      .max(64)
+      .regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/)
+      .optional(),
+    mode: z.enum(["default", "plan"]).optional(),
+    request_id: z
+      .string()
+      .min(1)
+      .max(128)
+      .regex(/^[\x21-\x7e]+$/)
+      .optional(),
+  })
+  .strict();
+
+export type ContinueExecutionInput = z.infer<typeof CONTINUE_INPUT_SCHEMA>;
+
 interface AuthorizedLease {
   project: ProjectRecord;
   profileName: string;
@@ -62,10 +85,24 @@ interface LeaseResult {
   lease?: AuthorizedLease;
 }
 
+interface AuthorizedContinuationLease {
+  project: ProjectRecord;
+  profile: AgentProfile;
+  threadId: string;
+  intent: AppendTurnIntentInput;
+  writerLock: FileLockHandle;
+}
+
+interface ContinuationLeaseResult {
+  replay?: TaskAllocation;
+  lease?: AuthorizedContinuationLease;
+}
+
 interface ActiveExecution {
   allocation: TaskAllocation;
   project: ProjectRecord;
   profile: AgentProfile;
+  mode: "default" | "plan";
   writerLock: FileLockHandle;
   prompt: string;
   threadId?: string;
@@ -229,12 +266,6 @@ export class AgentExecutionService {
     const parsed = START_INPUT_SCHEMA.safeParse(value);
     if (!parsed.success) throw new TaskError("task_invalid_input");
     const input = parsed.data;
-    if (input.mode !== undefined && input.mode !== "default") {
-      throw executionError(
-        "unsupported_task_mode",
-        "Only the default Codex execution mode is available in this milestone.",
-      );
-    }
 
     return this.runtime.manager.withStartRequestLock(
       input.request_id,
@@ -262,35 +293,73 @@ export class AgentExecutionService {
           throw error;
         }
 
-        const active = this.createActive(allocation, lease, input.prompt);
-        this.reservations -= 1;
-        this.active.set(allocation.task_id, active);
+        return this.launchAllocatedTurn(
+          allocation,
+          lease.project,
+          lease.profile,
+          lease.writerLock,
+          input.prompt,
+          input.mode ?? "default",
+          (active) => this.startNewThreadTurn(active),
+          false,
+        );
+      },
+    );
+  }
+
+  async continueTask(value: ContinueExecutionInput): Promise<TaskAllocation> {
+    if (
+      this.closed ||
+      this.poisoned ||
+      this.sessionFailure ||
+      this.runtime.isClosed
+    ) {
+      throw new TaskError("agent_runtime_unavailable");
+    }
+    const parsed = CONTINUE_INPUT_SCHEMA.safeParse(value);
+    if (!parsed.success) throw new TaskError("task_invalid_input");
+    const input = parsed.data;
+
+    return this.runtime.manager.withStartRequestLock(
+      input.request_id,
+      async () => {
+        const result = await this.authorizeAndLeaseContinuation(input);
+        if (result.replay) return result.replay;
+        const lease = result.lease;
+        if (!lease) throw new TaskError("task_store_error");
+
+        let allocation: TaskAllocation;
         try {
-          await this.startTurn(active);
-          if (!active.accepted)
-            throw new TaskError("agent_runtime_unavailable");
+          allocation = await this.runtime.manager.appendTurnIntent(
+            lease.intent,
+            true,
+          );
         } catch (error) {
-          const knownRejection =
-            active.turnStartIssued &&
-            !active.accepted &&
-            active.earlyEvents.length === 0 &&
-            isCertainStartRejection(error);
-          if (active.turnStartIssued && !knownRejection) {
-            await this.handleSessionFailure();
-          } else {
-            await this.finish(active, "failed", knownRejection);
-          }
-          let record: TaskRecord;
           try {
-            record = await this.runtime.manager.getTask(allocation.task_id);
+            await lease.writerLock.release();
+            this.reservations -= 1;
           } catch {
-            throw new TaskError("task_store_error");
+            this.poisoned = true;
+            await this.adapter.close().catch(() => undefined);
+            throw new TaskError("agent_runtime_unavailable");
           }
-          if (!isTerminal(record.state))
-            throw new TaskError("task_store_error");
-          throw safeStartError(error);
+          throw error;
         }
-        return allocation;
+        if (allocation.replayed) {
+          await lease.writerLock.release();
+          this.reservations -= 1;
+          return allocation;
+        }
+        return this.launchAllocatedTurn(
+          allocation,
+          lease.project,
+          lease.profile,
+          lease.writerLock,
+          input.prompt,
+          input.mode ?? "default",
+          (active) => this.resumeThreadTurn(active, lease.threadId),
+          true,
+        );
       },
     );
   }
@@ -331,7 +400,11 @@ export class AgentExecutionService {
     const active = [...this.active.values()];
     for (const execution of active) {
       if (!execution.turnStartIssued) {
-        await this.finish(execution, "interrupted");
+        await this.finish(
+          execution,
+          "interrupted",
+          execution.threadId !== undefined,
+        );
       } else {
         void this.requestInterrupt(execution);
       }
@@ -412,7 +485,7 @@ export class AgentExecutionService {
         prompt: input.prompt,
         profile: profileName,
         model_id: profile.model_id,
-        mode: "default",
+        mode: input.mode ?? "default",
         ...(input.request_id ? { request_id: input.request_id } : {}),
       };
       const replay = await this.runtime.manager.findStartReplay(intent);
@@ -483,10 +556,174 @@ export class AgentExecutionService {
     return outcome;
   }
 
+  private async authorizeAndLeaseContinuation(
+    input: ContinueExecutionInput,
+  ): Promise<ContinuationLeaseResult> {
+    const configLock = await acquireConfigMutationLock();
+    let writerLock: FileLockHandle | undefined;
+    let reserved = false;
+    let projectReleaseUncertain = false;
+    let outcome: ContinuationLeaseResult | undefined;
+    let didFail = false;
+    let failure: unknown;
+    try {
+      const record =
+        await this.runtime.manager.getTaskRecordForCurrentRegistration(
+          input.task_id,
+        );
+      const project = await getProject(record.project_id);
+      const policy = await readAgentPolicy();
+      const authorization = Object.hasOwn(policy.projects, project.id)
+        ? policy.projects[project.id]
+        : undefined;
+      if (
+        !project.registrationId ||
+        project.registrationId !== record.registration_id ||
+        project.addedAt !== record.registration_added_at ||
+        project.name !== record.display_name ||
+        !authorization ||
+        !authorizationMatchesProject(authorization, project)
+      ) {
+        throw new TaskError("task_registration_stale");
+      }
+      if (!authorization.enabled) {
+        throw executionError(
+          "agent_disabled",
+          "Agent execution is not enabled for the current project registration.",
+        );
+      }
+      if (!(await isGitRepository(project))) {
+        throw executionError(
+          "project_not_git",
+          "Agent execution requires a registered Git project.",
+        );
+      }
+      const privateThreadId = record.private_thread_id;
+      const priorTurn = record.turns.at(-1);
+      if (
+        !privateThreadId ||
+        privateThreadId.trim().length === 0 ||
+        !priorTurn ||
+        priorTurn.turn_number !== record.turn_count
+      ) {
+        throw new TaskError("task_state_conflict");
+      }
+
+      const profileName = input.profile ?? record.current_profile;
+      if (!authorization.allowed_profiles.includes(profileName)) {
+        throw executionError(
+          "profile_not_allowed",
+          "The requested profile is not allowed for this project.",
+        );
+      }
+      const profile = policy.profiles[profileName];
+      if (!profile) {
+        throw executionError(
+          "profile_not_found",
+          "The selected profile is unavailable.",
+        );
+      }
+
+      const mode = input.mode ?? "default";
+      const replayInput: AppendTurnIntentInput = {
+        task_id: record.task_id,
+        prompt: input.prompt,
+        ...(input.profile === undefined
+          ? {}
+          : { profile: profileName, model_id: profile.model_id }),
+        mode,
+        ...(input.request_id ? { request_id: input.request_id } : {}),
+      };
+      const replay = await this.runtime.manager.findContinueReplay(replayInput);
+      if (replay) {
+        outcome = { replay };
+      } else {
+        if (!isTerminal(record.state) || record.local_action_required) {
+          throw new TaskError("task_state_conflict");
+        }
+        if (this.activeCount >= MAX_ACTIVE_AGENT_TURNS) {
+          throw executionError(
+            "agent_capacity",
+            "The maximum number of active agent turns has been reached.",
+          );
+        }
+        this.reservations += 1;
+        reserved = true;
+        writerLock = await tryAcquireProjectWriterLock(project.root);
+        if (!writerLock) {
+          throw executionError(
+            "project_busy",
+            "Another agent task is already active for this project.",
+          );
+        }
+        const intent: AppendTurnIntentInput = {
+          task_id: record.task_id,
+          prompt: input.prompt,
+          profile: profileName,
+          model_id: profile.model_id,
+          mode,
+          ...(input.request_id ? { request_id: input.request_id } : {}),
+        };
+        outcome = {
+          lease: {
+            project,
+            profile,
+            threadId: privateThreadId,
+            intent,
+            writerLock,
+          },
+        };
+      }
+    } catch (error) {
+      didFail = true;
+      failure = error;
+      if (writerLock) {
+        try {
+          await writerLock.release();
+          writerLock = undefined;
+        } catch {
+          projectReleaseUncertain = true;
+          this.poisoned = true;
+          await this.adapter.close().catch(() => undefined);
+          failure = new TaskError("agent_runtime_unavailable");
+        }
+      }
+      if (reserved && !projectReleaseUncertain) {
+        this.reservations -= 1;
+        reserved = false;
+      }
+    }
+    try {
+      await configLock.release();
+    } catch {
+      if (!projectReleaseUncertain && writerLock) {
+        try {
+          await writerLock.release();
+          writerLock = undefined;
+          if (reserved) this.reservations -= 1;
+        } catch {
+          // Keep the reservation when releasing the writer lease is uncertain.
+        }
+      } else if (!writerLock && !projectReleaseUncertain && reserved) {
+        this.reservations -= 1;
+      }
+      this.poisoned = true;
+      await this.adapter.close().catch(() => undefined);
+      didFail = true;
+      failure = new TaskError("agent_runtime_unavailable");
+    }
+    if (didFail) throw failure;
+    if (!outcome) throw new TaskError("task_store_error");
+    return outcome;
+  }
+
   private createActive(
     allocation: TaskAllocation,
-    lease: AuthorizedLease,
+    project: ProjectRecord,
+    profile: AgentProfile,
+    writerLock: FileLockHandle,
     originalPrompt: string,
+    mode: "default" | "plan",
   ): ActiveExecution {
     let finish!: () => void;
     const finished = new Promise<void>((resolve) => {
@@ -494,9 +731,10 @@ export class AgentExecutionService {
     });
     return {
       allocation,
-      project: lease.project,
-      profile: lease.profile,
-      writerLock: lease.writerLock,
+      project,
+      profile,
+      mode,
+      writerLock,
       prompt: executionPrompt(originalPrompt),
       turnStartIssued: false,
       accepted: false,
@@ -510,7 +748,58 @@ export class AgentExecutionService {
     };
   }
 
-  private async startTurn(active: ActiveExecution): Promise<void> {
+  private async launchAllocatedTurn(
+    allocation: TaskAllocation,
+    project: ProjectRecord,
+    profile: AgentProfile,
+    writerLock: FileLockHandle,
+    prompt: string,
+    mode: "default" | "plan",
+    prepare: (active: ActiveExecution) => Promise<void>,
+    releaseVerifiedThreadOnPreStartFailure: boolean,
+  ): Promise<TaskAllocation> {
+    const active = this.createActive(
+      allocation,
+      project,
+      profile,
+      writerLock,
+      prompt,
+      mode,
+    );
+    this.reservations -= 1;
+    this.active.set(allocation.task_id, active);
+    try {
+      await prepare(active);
+      if (!active.accepted) throw new TaskError("agent_runtime_unavailable");
+    } catch (error) {
+      const knownRejection =
+        active.turnStartIssued &&
+        !active.accepted &&
+        active.earlyEvents.length === 0 &&
+        isCertainStartRejection(error);
+      if (active.turnStartIssued && !knownRejection) {
+        await this.handleSessionFailure();
+      } else {
+        const releaseThread =
+          knownRejection ||
+          (releaseVerifiedThreadOnPreStartFailure &&
+            !active.turnStartIssued &&
+            active.threadId !== undefined);
+        await this.finish(active, "failed", releaseThread);
+      }
+      let record: TaskRecord;
+      try {
+        record = await this.runtime.manager.getTask(allocation.task_id);
+      } catch {
+        throw new TaskError("task_store_error");
+      }
+      if (!isTerminal(record.state)) throw new TaskError("task_store_error");
+      throw safeStartError(error);
+    }
+    return allocation;
+  }
+
+  private async startNewThreadTurn(active: ActiveExecution): Promise<void> {
     const baseline = await this.baselineCapture(active.project);
     if (!this.isActive(active)) return;
     await this.runtime.manager.setGitBaseline(
@@ -550,7 +839,68 @@ export class AgentExecutionService {
       model: active.profile.model_id,
       effort: active.profile.reasoning_effort,
       prompt: active.prompt,
+      mode: active.mode,
     });
+    await this.acceptStartedTurn(active, thread.threadId, turn);
+  }
+
+  private async resumeThreadTurn(
+    active: ActiveExecution,
+    storedThreadId: string,
+  ): Promise<void> {
+    const backend = await this.adapter.start();
+    if (!this.isActive(active)) return;
+    await this.adapter.requireAuthentication();
+    if (!this.isActive(active)) return;
+    await this.adapter.validateProfile(active.profile);
+    if (!this.isActive(active)) return;
+    await this.runtime.manager.setDetectedCodexVersion(
+      active.allocation.task_id,
+      backend.version,
+    );
+    if (!this.isActive(active)) return;
+
+    const thread = await this.adapter.resumeThread({
+      threadId: storedThreadId,
+      root: active.project.root,
+      model: active.profile.model_id,
+    });
+    if (!this.isActive(active)) return;
+    if (thread.threadId !== storedThreadId) {
+      throw new AgentAdapterError("app_server_incompatible");
+    }
+    active.threadId = storedThreadId;
+    this.byThread.set(storedThreadId, active);
+
+    const baseline = await this.baselineCapture(active.project);
+    if (!this.isActive(active)) return;
+    await this.runtime.manager.setGitBaseline(
+      active.allocation.task_id,
+      baseline,
+    );
+    if (!this.isActive(active)) return;
+
+    const turn = await this.issueTurnStart(active, storedThreadId);
+    await this.acceptStartedTurn(active, storedThreadId, turn);
+  }
+
+  private async issueTurnStart(active: ActiveExecution, threadId: string) {
+    active.turnStartIssued = true;
+    return this.adapter.startTurn({
+      threadId,
+      root: active.project.root,
+      model: active.profile.model_id,
+      effort: active.profile.reasoning_effort,
+      prompt: active.prompt,
+      mode: active.mode,
+    });
+  }
+
+  private async acceptStartedTurn(
+    active: ActiveExecution,
+    threadId: string,
+    turn: Awaited<ReturnType<AgentExecutionAdapter["startTurn"]>>,
+  ): Promise<void> {
     active.turnId = turn.turnId;
     active.accepted = true;
     if (this.active.get(active.allocation.task_id) !== active) return;
@@ -577,7 +927,7 @@ export class AgentExecutionService {
     if (turn.status !== "inProgress") {
       this.enqueueEvent(active, {
         type: "turn_completed",
-        threadId: thread.threadId,
+        threadId,
         turnId: turn.turnId,
         status: turn.status,
       });

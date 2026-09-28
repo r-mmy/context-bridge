@@ -299,12 +299,76 @@ export class CodexAgentAdapter implements AgentExecutionAdapter {
     return { threadId: result.thread.id };
   }
 
+  async resumeThread(input: {
+    threadId: string;
+    root: string;
+    model: string;
+  }): Promise<AgentExecutionThread> {
+    const result = await this.appServer.resumeThread({
+      threadId: input.threadId,
+      model: input.model,
+      cwd: input.root,
+      runtimeWorkspaceRoots: [input.root],
+      approvalPolicy: "never",
+      sandbox: "workspace-write",
+      excludeTurns: true,
+    });
+    const sandbox =
+      isRecord(result) && isRecord(result.sandbox) ? result.sandbox : undefined;
+    const writableRoots = sandbox?.writableRoots;
+    const invalidWritableRoots =
+      writableRoots !== undefined &&
+      (!Array.isArray(writableRoots) ||
+        writableRoots.some((root) => typeof root !== "string") ||
+        (Array.isArray(writableRoots) &&
+          writableRoots.length > 0 &&
+          (writableRoots.length !== 1 || writableRoots[0] !== input.root)));
+    const invalidResume =
+      !isRecord(result) ||
+      !isRecord(result.thread) ||
+      result.thread.id !== input.threadId ||
+      result.model !== input.model ||
+      result.cwd !== input.root ||
+      result.approvalPolicy !== "never" ||
+      !sandbox ||
+      sandbox.type !== "workspaceWrite" ||
+      (sandbox.networkAccess !== undefined &&
+        typeof sandbox.networkAccess !== "boolean") ||
+      sandbox.networkAccess === true ||
+      (sandbox.excludeTmpdirEnvVar !== undefined &&
+        typeof sandbox.excludeTmpdirEnvVar !== "boolean") ||
+      (sandbox.excludeSlashTmp !== undefined &&
+        typeof sandbox.excludeSlashTmp !== "boolean") ||
+      invalidWritableRoots ||
+      !Array.isArray(result.runtimeWorkspaceRoots) ||
+      result.runtimeWorkspaceRoots.length !== 1 ||
+      result.runtimeWorkspaceRoots[0] !== input.root ||
+      typeof result.modelProvider !== "string" ||
+      result.modelProvider.length === 0 ||
+      result.modelProvider.length > 128 ||
+      !Object.hasOwn(result, "approvalsReviewer");
+    if (invalidResume) {
+      // A successful RPC may have subscribed the requested thread even when
+      // its effective workspace response is unusable. Release only the
+      // locally stored ID; never trust a mismatched ID from the response.
+      try {
+        const released = await this.releaseThread({ threadId: input.threadId });
+        if (!released.closedObserved) await this.close();
+      } catch {
+        await this.close().catch(() => undefined);
+      }
+      throw new AgentAdapterError("app_server_incompatible");
+    }
+    return { threadId: input.threadId };
+  }
+
   async startTurn(input: {
     threadId: string;
     root: string;
     model: string;
     effort: string;
     prompt: string;
+    mode: "default" | "plan";
   }): Promise<AgentExecutionTurn> {
     const result = await this.appServer.startTurn({
       threadId: input.threadId,
@@ -321,6 +385,14 @@ export class CodexAgentAdapter implements AgentExecutionAdapter {
       },
       model: input.model,
       effort: input.effort,
+      collaborationMode: {
+        mode: input.mode,
+        settings: {
+          model: input.model,
+          reasoning_effort: input.effort,
+          developer_instructions: null,
+        },
+      },
     });
     if (
       !isRecord(result) ||

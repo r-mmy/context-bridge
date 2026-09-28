@@ -355,6 +355,19 @@ export class CodexAppServer {
     return session.request("thread/start", params);
   }
 
+  async resumeThread(params: {
+    threadId: string;
+    model: string;
+    cwd: string;
+    runtimeWorkspaceRoots: [string];
+    approvalPolicy: "never";
+    sandbox: "workspace-write";
+    excludeTurns: true;
+  }): Promise<unknown> {
+    const session = await this.getReadySession();
+    return session.request("thread/resume", params);
+  }
+
   async startTurn(params: {
     threadId: string;
     input: [{ type: "text"; text: string }];
@@ -370,6 +383,14 @@ export class CodexAppServer {
     };
     model: string;
     effort: string;
+    collaborationMode: {
+      mode: "default" | "plan";
+      settings: {
+        model: string;
+        reasoning_effort: string;
+        developer_instructions: null;
+      };
+    };
   }): Promise<unknown> {
     const session = await this.getReadySession();
     return session.request("turn/start", params);

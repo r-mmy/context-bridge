@@ -1,7 +1,11 @@
 import { open, stat } from "node:fs/promises";
 import type { ProjectRecord } from "../projects/registry.js";
 import { ContextBridgeError } from "../security/errors.js";
-import { isProjectPathVisible, resolveProjectPath } from "../security/paths.js";
+import {
+  createProjectIgnoreMatcherCache,
+  isProjectPathVisible,
+  resolveProjectPath,
+} from "../security/paths.js";
 import { clampOutputBytes, truncateUtf8 } from "../filesystem/read.js";
 import { collectProjectFiles } from "../filesystem/walk.js";
 import { GitRepository } from "./run.js";
@@ -38,13 +42,15 @@ function splitNul(buffer: Buffer): string[] {
 async function visiblePaths(
   project: ProjectRecord,
   candidates: string[],
+  ignoreMatcherCache = createProjectIgnoreMatcherCache(),
 ): Promise<string[]> {
   const allowed: string[] = [];
   const seen = new Set<string>();
   for (const candidate of candidates) {
     if (!candidate || seen.has(candidate)) continue;
     seen.add(candidate);
-    if (await isProjectPathVisible(project, candidate)) allowed.push(candidate);
+    if (await isProjectPathVisible(project, candidate, ignoreMatcherCache))
+      allowed.push(candidate);
   }
   return allowed;
 }
@@ -162,10 +168,15 @@ async function listUntracked(
   project: ProjectRecord,
   repository: GitRepository,
   pathFilter?: string,
+  ignoreMatcherCache = createProjectIgnoreMatcherCache(),
 ): Promise<{ paths: string[]; truncated: boolean }> {
   let discovered: Awaited<ReturnType<typeof collectProjectFiles>>;
   try {
-    discovered = await collectProjectFiles(project, pathFilter ?? ".");
+    discovered = await collectProjectFiles(
+      project,
+      pathFilter ?? ".",
+      ignoreMatcherCache,
+    );
   } catch (error) {
     if (error instanceof ContextBridgeError && error.code === "path_missing")
       return { paths: [], truncated: false };
@@ -287,6 +298,7 @@ async function readUntrackedPatch(
 
 export async function getGitStatus(project: ProjectRecord): Promise<GitStatus> {
   const repository = new GitRepository(project);
+  const ignoreMatcherCache = createProjectIgnoreMatcherCache();
   const scope = await repository.scope();
   const args = [
     "status",
@@ -336,7 +348,10 @@ export async function getGitStatus(project: ProjectRecord): Promise<GitStatus> {
     const y = record[1] ?? " ";
     const relativePath = await repository.projectPath(record.slice(3));
     if (!relativePath) continue;
-    if (!(await isProjectPathVisible(project, relativePath))) continue;
+    if (
+      !(await isProjectPathVisible(project, relativePath, ignoreMatcherCache))
+    )
+      continue;
     if (x === "?" && y === "?") {
       untracked.add(relativePath);
       continue;
@@ -353,11 +368,13 @@ export async function getGitStatus(project: ProjectRecord): Promise<GitStatus> {
       modified.add(relativePath);
     if (x === "D" || y === "D") deleted.add(relativePath);
   }
-  const untrackedCandidates = await listUntracked(project, repository);
-  for (const relativePath of await visiblePaths(
+  const untrackedCandidates = await listUntracked(
     project,
-    untrackedCandidates.paths,
-  ))
+    repository,
+    undefined,
+    ignoreMatcherCache,
+  );
+  for (const relativePath of untrackedCandidates.paths)
     untracked.add(relativePath);
   const sort = (values: Set<string>) =>
     [...values].sort((left, right) => left.localeCompare(right));

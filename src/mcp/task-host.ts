@@ -2,8 +2,10 @@ import type { AgentExecutionAdapter } from "../agents/adapter.js";
 import { getCodexAgentAdapter } from "../agents/codex/adapter.js";
 import {
   AgentExecutionService,
+  type ContinueExecutionInput,
   type StartExecutionInput,
 } from "../agents/execution.js";
+import type { TaskAllocation } from "../tasks/manager.js";
 import { TaskError } from "../tasks/errors.js";
 import { TaskRuntime } from "../tasks/runtime.js";
 import type { TaskRecord } from "../tasks/types.js";
@@ -13,9 +15,15 @@ export interface TaskRecordPage {
   truncated: boolean;
 }
 
+export interface TaskContinuationResult {
+  record: TaskRecord;
+  allocation: TaskAllocation;
+}
+
 /** Internal operations required by the public task MCP façade. */
 export interface TaskToolHost {
   startTask(input: StartExecutionInput): Promise<TaskRecord>;
+  continueTask(input: ContinueExecutionInput): Promise<TaskContinuationResult>;
   getTask(taskId: string): Promise<TaskRecord>;
   waitForTask(
     taskId: string,
@@ -70,6 +78,17 @@ export class LazyTaskToolHost implements TaskToolHost {
       // Authorization was checked atomically by startTask; return its durable
       // accepted record even if registration changes immediately afterward.
       return (await this.getRuntime()).manager.getTask(allocation.task_id);
+    });
+  }
+
+  continueTask(input: ContinueExecutionInput): Promise<TaskContinuationResult> {
+    return this.trackExecutionOperation(async () => {
+      const service = await this.getExecutionService();
+      const allocation = await service.continueTask(input);
+      const record = await (
+        await this.getRuntime()
+      ).manager.getTask(allocation.task_id);
+      return { record, allocation };
     });
   }
 
