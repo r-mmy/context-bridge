@@ -1,16 +1,14 @@
 ---
 name: project-context
-description: Use Context Bridge to inspect a project that the user registered locally.
+description: Inspect locally registered projects with Context Bridge and use its controlled Codex task tools only when the user explicitly requests workspace changes.
 ---
 
 # Project context
 
-Use these steps when Context Bridge is available:
-
-1. Call `projects_list` to discover registered project IDs, then `project_get` for the project you need. Never guess or provide a filesystem root.
-2. Call `git_status` before assuming what repository state the user has.
-3. Search narrowly with `files_search` before reading large parts of a repository. Retrieve only relevant files and line ranges with `file_read`.
-4. When reviewing recent implementation work, use `git_diff` to inspect the current changes. Use `git_log` or `git_show` only for the specific history needed.
-5. Never claim to have inspected files, lines, diffs, or commits that were not actually returned by Context Bridge.
-
-The original file and Git tools are read-only. On the stdio server, `task_start` can let Codex read or edit a project only after local agent authorization is enabled; a successful start means accepted, not completed. Use `task_get` to check progress. If it returns `pending_input`, present the question to the user and wait for their explicit answer; never choose or invent one. Call `task_answer` only with the user's answer, then keep polling that same task because it resumes the same active Codex turn. Secret questions are not relayed and require local action. `task_continue` can continue a terminal task in its same Codex thread after Context Bridge verifies the current project registration and root. `task_cancel` may leave partial edits. Review actual changes with `git_status` and `git_diff`. Codex has no network access, and baseline counts alone do not prove a file changed.
+1. Call `projects_list`, then `project_get` for the intended project. Never guess a project ID or filesystem root.
+2. Call `git_status` before assuming repository state. Search narrowly with `files_search`; read only relevant paths with `file_read`. Use `git_diff`, `git_log`, or `git_show` for the specific review needed. Never claim to have inspected content a tool did not return.
+3. The file and Git tools are read-only. Call `task_start` only after the user clearly requests a change and the project is locally authorized. A successful start means accepted, not complete. Poll `task_get` until terminal or `waiting_for_input`.
+4. For a blocking question, show the actual question and options to the user. Do not choose or invent an answer. Call `task_answer` only with the user's explicit answer, then keep polling the same task: it resumes the same active turn. Secret questions fail closed and require local action.
+5. Use `task_continue` for a requested follow-up on the same Codex thread. It revalidates project registration and authorization. Do not assume a thread is grouped under a matching Codex Desktop sidebar project.
+6. `task_cancel` interrupts work but does not roll back edits. After cancellation, interruption, or completion, independently inspect `git_status` and `git_diff`. Do not claim the agent committed or pushed; Context Bridge provides no direct commit/push tool, and its execution rules do not guarantee that a model process can never attempt Git mutation.
+7. Interpret usage carefully: `total_tokens` is authoritative cumulative usage; cached input is a subset of input and reasoning output a subset of output. Do not add subsets again. Per-turn deltas have a quality marker; `model_request_count` is unavailable/null and usage does not imply cost or quota.

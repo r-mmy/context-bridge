@@ -47,8 +47,8 @@ import { startStdioServer } from "../transports/stdio.js";
 const VERSION = "0.1.0";
 
 const HELP = `Context Bridge v${VERSION}
-Read-only access to explicitly registered local projects through MCP.
-Local agent commands manage authorization only; M1 does not execute projects.
+Inspect explicitly registered projects through read-only MCP tools.
+Stdio task tools run Codex only for projects enabled locally; HTTP stays read-only.
 
 Usage:
   ctxbridge init
@@ -109,7 +109,7 @@ function defaultIO(): CliIO {
 }
 
 const AGENT_ENABLE_WARNING = `SECURITY WARNING: Enabling agent authorization is stronger than read-only Context Bridge access.
-Codex will eventually receive direct read/write access to this project and may modify its files. Context Bridge's sensitive-file denylist will not mediate Codex's own reads. Execution will rely on the Codex/OS sandbox as an additional boundary, not as a guarantee. M1 records authorization only; it does not start Codex or execute project work.
+Codex will eventually receive direct read/write access to this project and may modify its files. Context Bridge's sensitive-file denylist will not mediate Codex's own reads. Execution will rely on the Codex/OS sandbox as an additional boundary, not as a guarantee. This command records local authorization only; it does not start a task. Tasks are started through the stdio MCP tools.
 `;
 
 function requireProjectId(value: string | undefined): string {
@@ -192,7 +192,7 @@ function parseProfileAdd(args: string[]): {
   if (!profile.success) {
     throw new ContextBridgeError(
       "invalid_profile",
-      "Provide a valid model ID and reasoning-effort identifier. M1 does not verify Codex model support.",
+      "Provide a valid model ID and reasoning-effort identifier.",
     );
   }
   return { name, profile: profile.data };

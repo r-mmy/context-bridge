@@ -85,6 +85,30 @@ describe.sequential("agent M1 CLI", () => {
     expect(help.output.join("")).toContain(
       "ctxbridge agent enable|disable|status",
     );
+    expect(help.output.join("")).toContain(
+      "Stdio task tools run Codex only for projects enabled locally; HTTP stays read-only.",
+    );
+    expect(help.output.join("")).not.toContain("M1 does not execute projects");
+    const invalidProfile = testIO(root);
+    expect(
+      await runCli(
+        [
+          "agent",
+          "profile",
+          "add",
+          "bad-profile",
+          "--model",
+          "bad model",
+          "--effort",
+          "max",
+        ],
+        invalidProfile,
+      ),
+    ).toBe(1);
+    expect(invalidProfile.errors.join("")).toContain(
+      "Provide a valid model ID and reasoning-effort identifier.",
+    );
+    expect(invalidProfile.errors.join("")).not.toContain("M1");
     expect(await runCli(["agent", "profile", "list"], list)).toBe(0);
     expect(list.output.join("")).toContain(
       "luna-max\tgpt-6-luna\tmax (default)",
@@ -110,6 +134,12 @@ describe.sequential("agent M1 CLI", () => {
     expect(nonGitIO.errors.join("")).toContain("registered Git repository");
     expect(await runCli(["agent", "enable", gitProject.id], noTTY)).toBe(1);
     expect(noTTY.output.join("")).toContain("stronger than read-only");
+    expect(noTTY.output.join("")).toContain(
+      "This command records local authorization only; it does not start a task.",
+    );
+    expect(noTTY.output.join("")).not.toContain(
+      "M1 records authorization only",
+    );
     expect(noTTY.errors.join("")).toContain("interactive terminal");
     expect(await runCli(["agent", "enable", gitProject.id], declined)).toBe(1);
     expect(declined.errors.join("")).toContain("declined or unavailable");

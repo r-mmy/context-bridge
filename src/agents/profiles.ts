@@ -8,8 +8,8 @@ export const ProfileNameSchema = z
   .max(64)
   .regex(PROFILE_NAME_PATTERN);
 
-// M1 validates safe local identifier syntax only. Whether Codex supports a
-// particular model and effort is checked by the later App Server milestone.
+// Persisted profile fields use bounded identifier syntax. The CLI also asks
+// the local App Server to validate a profile's model and reasoning effort.
 export const AgentProfileSchema = z
   .object({
     model_id: z

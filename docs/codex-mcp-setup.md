@@ -1,22 +1,6 @@
-# Codex MCP setup
+# Connect Codex Desktop
 
-Context Bridge's stdio transport is the recommended local connection. Use Node.js 20 or newer, pnpm 12.4.2 (the version pinned by this repository), and Git. From the cloned Context Bridge checkout, install and build it:
-
-```sh
-pnpm install --frozen-lockfile
-pnpm build
-pnpm add -g .
-ctxbridge init
-ctxbridge project add /path/to/project
-ctxbridge doctor
-```
-
-On Windows PowerShell, a project path can look like `C:\code\my-project`.
-
-If `ctxbridge` is not found after installation, run `pnpm setup` to configure
-pnpm's global executable directory, then open a new terminal.
-
-Add the MCP server to Codex's user or project MCP configuration using the supported `mcpServers` format:
+Context Bridge runs as a local stdio MCP server. After building and installing the CLI as described in the [README](../README.md), add this entry to Codex's user or project MCP configuration using its supported `mcpServers` format:
 
 ```json
 {
@@ -29,6 +13,18 @@ Add the MCP server to Codex's user or project MCP configuration using the suppor
 }
 ```
 
-Restart or reload Codex's MCP servers, then ask it to call `projects_list`. Select a registered ID with `project_get` before reading or searching files. The server's instructions ask clients to inspect Git status and retrieve only relevant paths.
+Restart or reload Codex's MCP servers, then call `projects_list` and select a project with `project_get`. The stdio server exposes nine read-only inspection tools and six task tools. Inspection alone is available to registered projects; task execution still requires a local interactive `ctxbridge agent enable <project-id>` confirmation for each project.
 
-To use the local HTTP endpoint instead, run `ctxbridge mcp --http --port 7331` and configure a client that supports Streamable HTTP at `http://127.0.0.1:7331/mcp`. It remains bound to this computer.
+The task tools launch Context Bridge's own managed, pinned Codex App Server process for the selected project. That managed thread is separate from the Codex model and conversation driving the outer Desktop session. It does not create unlimited or recursive agent behavior. See [README](../README.md) for the task workflow, cancellation, recovery, user-input relay, and telemetry. See [SECURITY.md](../SECURITY.md) for the trust boundaries.
+
+To run the server from a source checkout during development, execute `pnpm exec tsx src/cli/main.ts mcp --stdio` from that checkout. For regular Codex MCP configuration, use the globally installed `ctxbridge` command shown above.
+
+## Local HTTP alternative
+
+For a client that needs Streamable HTTP, run:
+
+```sh
+ctxbridge mcp --http --port 7331
+```
+
+It listens on `127.0.0.1:7331/mcp` and validates Host and Origin. HTTP exposes only the nine read-only inspection tools; it does not register any task tools.
