@@ -44,7 +44,7 @@ import { getCodexAgentAdapter } from "../agents/codex/adapter.js";
 import { startHttpServer } from "../transports/http.js";
 import { startStdioServer } from "../transports/stdio.js";
 
-const VERSION = "0.1.0";
+const VERSION = "0.2.0";
 
 const HELP = `Context Bridge v${VERSION}
 Inspect explicitly registered projects through read-only MCP tools.

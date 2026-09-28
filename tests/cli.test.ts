@@ -41,7 +41,7 @@ describe.sequential("CLI", () => {
     expect(output.join("")).toContain("ctxbridge project add [path]");
     output.length = 0;
     expect(await runCli(["--version"], io)).toBe(0);
-    expect(output.join("").trim()).toBe("0.1.0");
+    expect(output.join("").trim()).toBe("0.2.0");
     output.length = 0;
     expect(await runCli(["init"], io)).toBe(0);
     expect(output.join("")).toContain("initialized");

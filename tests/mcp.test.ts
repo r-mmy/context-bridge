@@ -59,6 +59,10 @@ describe.sequential("MCP contract", () => {
       server.connect(serverTransport),
     ]);
     try {
+      expect(client.getServerVersion()).toMatchObject({
+        name: "Context Bridge",
+        version: "0.2.0",
+      });
       const listed = await client.listTools();
       const names = listed.tools.map((tool) => tool.name).sort();
       expect(names).toEqual([

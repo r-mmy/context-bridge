@@ -2,7 +2,7 @@
 
 Context Bridge gives MCP-compatible assistants access to explicitly registered local projects. Its file and Git tools are read-only. On stdio only, a project can also opt in to bounded Codex tasks through the locally installed, pinned Codex App Server.
 
-The v0.2 implementation is in this private source repository. Package metadata remains `context-bridge-dev@0.1.0` and is not published. Codex App Server is experimental; Linux and macOS real authenticated execution and sandbox behavior have not been manually verified.
+The GitHub source repository is public. The npm package metadata is `context-bridge-dev@0.2.0`, remains private, and is unpublished. Codex App Server is experimental; Linux and macOS real authenticated execution and sandbox behavior have not been manually verified.
 
 ## What it provides
 

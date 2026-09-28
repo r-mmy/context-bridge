@@ -90,7 +90,7 @@ export function createContextBridgeServer(
   const server = new McpServer(
     {
       name: "Context Bridge",
-      version: "0.1.0",
+      version: "0.2.0",
     },
     {
       instructions: options.taskHost

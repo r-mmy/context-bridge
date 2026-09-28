@@ -288,7 +288,11 @@ describe("Codex App Server adapter", () => {
       "initialized",
     ]);
     expect(requests[0]?.params).toMatchObject({
-      clientInfo: { name: "context_bridge" },
+      clientInfo: {
+        name: "context_bridge",
+        title: "Context Bridge",
+        version: "0.2.0",
+      },
       capabilities: { experimentalApi: true },
     });
     expect(harness.children[0]?.exitCode).toBe(0);

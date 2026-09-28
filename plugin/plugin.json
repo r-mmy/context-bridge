@@ -1,7 +1,7 @@
 {
   "name": "context-bridge",
-  "version": "0.1.0",
-  "description": "Read-only access to explicitly registered local projects through MCP.",
+  "version": "0.2.0",
+  "description": "Nine read-only inspection tools; six Codex task tools over stdio, disabled until locally enabled per Git project.",
   "license": "Apache-2.0",
   "mcpConfig": "mcp.json",
   "skills": ["skills/project-context/SKILL.md"]
