@@ -116,8 +116,9 @@ function processRequest(request) {
       process.exit(29);
     }
     if (request.result && complete) {
-      if (mode === "execution-server-request-fast") complete();
-      else setTimeout(complete, 5);
+      if (mode === "execution-server-request-delayed-terminal") {
+        setTimeout(complete, 1_000);
+      } else setTimeout(complete, 5);
     }
     return;
   }
@@ -950,7 +951,7 @@ function processRequest(request) {
     const sendsInput = [
       "m6-input-telemetry",
       "execution-server-request",
-      "execution-server-request-fast",
+      "execution-server-request-delayed-terminal",
       "execution-server-request-single",
       "execution-answer-exit-after-forward",
       "execution-secret-request",
@@ -1072,7 +1073,7 @@ function processRequest(request) {
       mode === "execution-uncorrelated-after-two" ||
       mode === "m6-input-telemetry" ||
       mode === "execution-server-request" ||
-      mode === "execution-server-request-fast" ||
+      mode === "execution-server-request-delayed-terminal" ||
       mode === "execution-server-request-single" ||
       mode === "execution-answer-exit-after-forward" ||
       mode === "execution-secret-request" ||

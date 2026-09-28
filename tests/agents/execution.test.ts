@@ -1949,7 +1949,9 @@ describe("internal controlled Codex execution", () => {
   });
 
   it("relays bounded multi-question input and continues the same default and Plan turns", async () => {
-    const harness = await createHarness("execution-server-request-fast");
+    const harness = await createHarness(
+      "execution-server-request-delayed-terminal",
+    );
     const project = await registerGitProject(harness, "server-request-project");
     const allocation = await harness.service.startTask({
       project_id: project.id,
@@ -2036,7 +2038,8 @@ describe("internal controlled Codex execution", () => {
         pending_input_id: pendingId,
         answers: validAnswers,
       }),
-    ).rejects.toMatchObject({ code: "pending_input_stale" });
+    ).rejects.toMatchObject({ code: "pending_input_not_found" });
+    expect(harness.service.activeCount).toBe(1);
     const firstTerminal = await waitForTerminal(
       harness.runtime,
       allocation.task_id,
