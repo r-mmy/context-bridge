@@ -4,7 +4,9 @@
 
 Open the repository's [Security Advisories page](https://github.com/r-mmy/context-bridge/security/advisories) and select **Report a vulnerability** to send a private report to the maintainers. Private vulnerability reporting is enabled for this repository. Do not open a public issue or pull request with vulnerability details. Do not include real credentials or unrelated private project contents in a report. See GitHub's [private vulnerability reporting guide](https://docs.github.com/en/code-security/how-tos/report-and-fix-vulnerabilities/report-privately) for details.
 
-Context Bridge v0.1 is a local, read-only project inspection service.
+Context Bridge v0.1's inspection tools remain read-only. The v0.2 task tools
+can run the locally installed, version-pinned Codex App Server against a Git
+project only after explicit local authorization.
 
 ## Access boundary
 
@@ -15,8 +17,54 @@ Context Bridge v0.1 is a local, read-only project inspection service.
 - Git worktree discovery and both Git metadata directories are canonicalized and must remain inside the discovered worktree. This rejects external `.git` pointers and linked worktrees whose shared Git metadata is outside that worktree. When a project is nested inside a larger worktree, Git pathspecs are scoped to the derived project prefix and returned paths are translated back to project-relative form.
 - Project roots are revalidated for each tool call. Removing a registration revokes access on the next call.
 - File and Git results share the same ignore and secret policy. Git is invoked only through fixed argument arrays with shell execution disabled. MCP-facing Git subprocesses disable all Git transport protocols and lazy fetching, reset credential helpers, and disable external diff/text conversion, global Git configuration, fsmonitor, pagers, and configured clean/smudge/process filters. Missing objects in partial/promisor clones fail locally instead of being fetched.
-- The MCP server has no write, shell, arbitrary Git, commit, or agent-execution tool. `project add`, `project remove`, and `init` update only the user registry.
+- The v0.1 inspection tools and HTTP MCP surface have no write, shell, arbitrary Git, commit, or agent-execution tool. `project add`, `project remove`, and `init` update only the user registry; controlled agent tasks are available over stdio only after local authorization.
 - HTTP listens on `127.0.0.1` only. Host and Origin validation reject non-local browser origins and DNS-rebinding hostnames. Requests without an Origin header are accepted for native MCP clients.
+
+## Agent execution trust boundary
+
+The relevant trust boundaries are the MCP client, Context Bridge, the
+registered filesystem root, the local Codex App Server, native Codex Desktop
+UI, and the operating-system account running them. Agent authorization is a
+local explicit opt-in and agent task tools are exposed over stdio only. The
+loopback HTTP server remains read-only and does not authenticate other
+processes owned by the same user.
+
+Codex reads and writes directly inside its approved workspace according to
+the Codex runtime and operating-system sandbox. Context Bridge's file denylist
+and ignore filtering do not mediate Codex reads or writes. Workspace-write
+confinement depends on Codex and operating-system enforcement; portable
+filesystem APIs cannot eliminate same-user path-swap races. Linux and macOS
+real authenticated App Server execution and sandbox behavior remain
+unverified. The App Server protocol is experimental and the managed
+`@openai/codex` runtime is pinned to 0.157.1.
+
+An unexpected App Server process exit interrupts the active task even if the
+child's stdio streams have not closed yet. The writer is released after the
+terminal state is stored; a turn is never replayed automatically. Resuming a
+thread requires an explicit `task_continue` and fresh registration/root checks.
+
+Context Bridge passes only its intentional child-environment allowlist and
+does not intentionally copy API keys, tunnel tokens, or arbitrary application
+secrets into the App Server environment. Codex's final assistant response can
+contain material it read from the workspace; it is stored and returned as a
+bounded response and is not filtered like `file_read` or `git_diff`.
+
+Agent turns support dirty worktrees. Context Bridge prepends execution rules
+instructing Codex to preserve existing work and not stage, commit, push, reset,
+clean, check out, switch branches, or otherwise change Git history. Context
+Bridge exposes no direct commit, push, or arbitrary-Git MCP tool. These are
+agent-execution rules, not a cryptographic or OS-level guarantee that a model
+process cannot attempt a Git mutation inside its authorized workspace.
+Workspace confinement still depends on the Codex runtime and OS sandbox.
+Context Bridge exposes no generic shell, command execution, or arbitrary App
+Server RPC tool.
+
+The managed App Server's experimental project registry did not share project
+identity/state with native Codex Desktop's project registry during the 0.157.1
+probe. Context Bridge v0.2 therefore starts projectless threads and does not
+associate them with Desktop sidebar projects. This is a UI grouping limitation;
+threads remain visible and usable, and same-thread continuation remains
+available.
 
 ## Ignore behavior
 

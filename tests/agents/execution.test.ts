@@ -22,8 +22,10 @@ import {
 import {
   disableProjectAuthorization,
   enableProjectAuthorization,
+  readAgentPolicy,
   addAgentProfile,
   setProjectAllowedProfiles,
+  writeAgentPolicy,
 } from "../../src/agents/policy.js";
 import { getTaskPath } from "../../src/config/paths.js";
 import { ContextBridgeError } from "../../src/security/errors.js";
@@ -44,6 +46,7 @@ interface Harness {
   root: string;
   tracePath: string;
   children: ChildProcessWithoutNullStreams[];
+  childLifecycles: Array<{ exitObserved: boolean }>;
   projects: ProjectRecord[];
   runtime: TaskRuntime;
   service: AgentExecutionService;
@@ -72,6 +75,7 @@ async function createHarness(
   const runtime = await TaskRuntime.start();
   const tracePath = path.join(root, "app-server-trace.jsonl");
   const children: ChildProcessWithoutNullStreams[] = [];
+  const childLifecycles: Harness["childLifecycles"] = [];
   const fakeEnvironment: NodeJS.ProcessEnv = {
     PATH: process.env.PATH ?? "",
     SYSTEMROOT: process.env.SYSTEMROOT ?? "C:\\Windows",
@@ -80,6 +84,11 @@ async function createHarness(
     HOME: path.join(root, "fake-home"),
     TMPDIR: os.tmpdir(),
     CODEX_HOME: path.join(root, "fake-codex-home"),
+    OPENAI_API_KEY: "SYNTHETIC_OPENAI_SECRET_SENTINEL",
+    ANTHROPIC_API_KEY: "SYNTHETIC_ANTHROPIC_SECRET_SENTINEL",
+    GITHUB_TOKEN: "SYNTHETIC_GITHUB_TOKEN_SENTINEL",
+    SECURE_MCP_TUNNEL_TOKEN: "SYNTHETIC_TUNNEL_SECRET_SENTINEL",
+    ARBITRARY_APP_SECRET: "SYNTHETIC_APP_SECRET_SENTINEL",
   };
   const adapter = new CodexAgentAdapter({
     environment: fakeEnvironment,
@@ -109,6 +118,9 @@ async function createHarness(
         windowsHide: true,
       }) as ChildProcessWithoutNullStreams;
       children.push(child);
+      const lifecycle = { exitObserved: false };
+      childLifecycles.push(lifecycle);
+      child.on("exit", () => (lifecycle.exitObserved = true));
       return child;
     },
   });
@@ -119,6 +131,13 @@ async function createHarness(
   );
   const projects: ProjectRecord[] = [];
   cleanups.push(async () => {
+    for (const pid of await readStdioHolderPids(tracePath)) {
+      try {
+        process.kill(pid, "SIGTERM");
+      } catch {
+        // The synthetic stdio holder may already have exited.
+      }
+    }
     await service.close().catch(() => undefined);
     await runtime.close().catch(() => undefined);
     for (const project of projects) {
@@ -135,7 +154,40 @@ async function createHarness(
     else process.env.HOME = prior.home;
     await rm(root, { recursive: true, force: true });
   });
-  return { root, tracePath, children, projects, runtime, service };
+  return {
+    root,
+    tracePath,
+    children,
+    childLifecycles,
+    projects,
+    runtime,
+    service,
+  };
+}
+
+async function readStdioHolderPids(tracePath: string): Promise<number[]> {
+  const trace = await readFile(tracePath, "utf8").catch(() => "");
+  const pids: number[] = [];
+  for (const line of trace.split("\n")) {
+    if (!line) continue;
+    try {
+      const entry: unknown = JSON.parse(line);
+      if (
+        entry !== null &&
+        typeof entry === "object" &&
+        "kind" in entry &&
+        entry.kind === "stdio-holder" &&
+        "pid" in entry &&
+        typeof entry.pid === "number" &&
+        Number.isSafeInteger(entry.pid)
+      ) {
+        pids.push(entry.pid);
+      }
+    } catch {
+      // Ignore incomplete synthetic trace lines during teardown.
+    }
+  }
+  return pids;
 }
 
 async function registerGitProject(
@@ -1123,6 +1175,51 @@ describe("internal controlled Codex execution", () => {
     await expectWriterReleased(harness, project);
   });
 
+  it("does not forward synthetic environment secrets into App Server or task data", async () => {
+    const harness = await createHarness("auth-absent");
+    const project = await registerGitProject(harness, "environment-secrets");
+    const input = {
+      project_id: project.id,
+      prompt: "Do not expose synthetic environment sentinels.",
+    };
+    const failure = await harness.service
+      .startTask(input)
+      .catch((error: unknown) => error);
+    expect(failure).toMatchObject({ code: "codex_unauthenticated" });
+    const record = await getOnlyStoredTask(harness);
+    const publicView = await harness.runtime.manager.getTaskView(
+      record.task_id,
+    );
+    const persisted = await readFile(getTaskPath(record.task_id), "utf8");
+    const trace = await readFile(harness.tracePath, "utf8");
+    for (const sentinel of [
+      "SYNTHETIC_OPENAI_SECRET_SENTINEL",
+      "SYNTHETIC_ANTHROPIC_SECRET_SENTINEL",
+      "SYNTHETIC_GITHUB_TOKEN_SENTINEL",
+      "SYNTHETIC_TUNNEL_SECRET_SENTINEL",
+      "SYNTHETIC_APP_SECRET_SENTINEL",
+    ]) {
+      expect(String(failure)).not.toContain(sentinel);
+      expect(JSON.stringify(record)).not.toContain(sentinel);
+      expect(JSON.stringify(publicView)).not.toContain(sentinel);
+      expect(persisted).not.toContain(sentinel);
+      expect(trace).not.toContain(sentinel);
+    }
+    const environmentCheck = trace
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as Record<string, unknown>)
+      .find((entry) => entry.kind === "environment-check");
+    expect(environmentCheck).toMatchObject({
+      hasOpenAiKey: false,
+      hasAnthropicKey: false,
+      hasGithubToken: false,
+      hasTunnelSecret: false,
+      hasArbitrarySecret: false,
+    });
+    await expectWriterReleased(harness, project);
+  });
+
   it("rejects an unavailable configured model before thread or turn start", async () => {
     const harness = await createHarness("model-unavailable");
     const project = await registerGitProject(harness, "model-failure-project");
@@ -1247,6 +1344,24 @@ describe("internal controlled Codex execution", () => {
         prompt: "This must not execute.",
       }),
     ).rejects.toMatchObject({ code: "project_not_git" });
+    expect(await harness.runtime.manager.listTasks()).toHaveLength(0);
+    await expect(readFile(harness.tracePath, "utf8")).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  });
+
+  it("keeps an unapproved registration off without allocating or starting Codex", async () => {
+    const harness = await createHarness("normal");
+    const root = path.join(harness.root, "default-off-project");
+    await mkdir(root, { recursive: true });
+    const project = await addProject(root);
+    harness.projects.push(project);
+    await expect(
+      harness.service.startTask({
+        project_id: project.id,
+        prompt: "An unapproved project must remain off.",
+      }),
+    ).rejects.toMatchObject({ code: "agent_disabled" });
     expect(await harness.runtime.manager.listTasks()).toHaveLength(0);
     await expect(readFile(harness.tracePath, "utf8")).rejects.toMatchObject({
       code: "ENOENT",
@@ -1640,6 +1755,35 @@ describe("internal controlled Codex execution", () => {
       }),
     ).rejects.toMatchObject({ code: "task_registration_stale" });
     expect(await traceMethods(stale)).not.toContain("thread/resume");
+  });
+
+  it("blocks continuation when a valid authorization is rebound to another root fingerprint", async () => {
+    const harness = await createHarness("normal");
+    const project = await registerGitProject(harness, "fingerprint-project");
+    const task = await harness.service.startTask({
+      project_id: project.id,
+      prompt: "Create a completed task before authorization tampering.",
+    });
+    await waitForTerminal(harness.runtime, task.task_id);
+    await waitForExecutionIdle(harness.service);
+    const methodsBefore = await traceMethods(harness);
+    const policy = await readAgentPolicy();
+    const authorization = policy.projects[project.id];
+    if (!authorization) throw new Error("Expected project authorization.");
+    policy.projects[project.id] = {
+      ...authorization,
+      root_fingerprint: "0".repeat(64),
+    };
+    await writeAgentPolicy(policy);
+
+    await expect(
+      harness.service.continueTask({
+        task_id: task.task_id,
+        prompt: "A changed root binding must never resume this thread.",
+      }),
+    ).rejects.toMatchObject({ code: "task_registration_stale" });
+    expect(await traceMethods(harness)).toEqual(methodsBefore);
+    await expectWriterReleased(harness, project);
   });
 
   it("reuses project writer exclusion for continuation", async () => {
@@ -2154,6 +2298,82 @@ describe("internal controlled Codex execution", () => {
     await expectWriterReleased(harness, project);
   });
 
+  it("never retries a user answer after forwarding becomes uncertain", async () => {
+    const harness = await createHarness("execution-answer-exit-after-forward");
+    const project = await registerGitProject(
+      harness,
+      "answer-uncertainty-project",
+    );
+    const allocation = await harness.service.startTask({
+      project_id: project.id,
+      prompt: "Wait for one answer, then lose the disposable App Server.",
+    });
+    const waiting = await waitForPendingInput(
+      harness.runtime,
+      allocation.task_id,
+    );
+    if (!waiting.pending_input) throw new Error("expected pending input");
+    const pendingId = waiting.pending_input.pending_input_id;
+    const answers = [
+      { question_id: "choice", answers: ["Proceed"] },
+      { question_id: "note", answers: ["confirmed"] },
+      { question_id: "choice-with-note", answers: ["Proceed"] },
+      { question_id: "__proto__", answers: ["confirmed"] },
+    ];
+    await harness.service
+      .answerUserInput({
+        task_id: allocation.task_id,
+        pending_input_id: pendingId,
+        answers,
+      })
+      .catch(() => undefined);
+
+    const appServer = harness.children.at(-1);
+    if (!appServer) throw new Error("expected the fake App Server process");
+    const processClosed =
+      appServer.exitCode !== null || appServer.signalCode !== null
+        ? true
+        : await Promise.race([
+            new Promise<boolean>((resolve) =>
+              appServer.once("close", () => resolve(true)),
+            ),
+            new Promise<boolean>((resolve) =>
+              setTimeout(() => resolve(false), 1_000),
+            ),
+          ]);
+    expect(processClosed).toBe(true);
+
+    const terminal = await waitForTerminal(harness.runtime, allocation.task_id);
+    expect(["failed", "interrupted"]).toContain(terminal.state);
+    expect(terminal.pending_input).toBeNull();
+    expect(terminal.turn_count).toBe(1);
+    await expect(
+      harness.service.answerUserInput({
+        task_id: allocation.task_id,
+        pending_input_id: pendingId,
+        answers,
+      }),
+    ).rejects.toMatchObject({
+      code: expect.stringMatching(/pending_input_(?:not_found|stale)/),
+    });
+
+    const trace = (await readFile(harness.tracePath, "utf8"))
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    expect(trace.filter((entry) => entry.method === "turn/start")).toHaveLength(
+      1,
+    );
+    expect(
+      trace.filter((entry) => entry.method === "thread/start"),
+    ).toHaveLength(1);
+    expect(
+      trace.filter((entry) => entry.kind === "user-input-response"),
+    ).toHaveLength(1);
+    await waitForExecutionIdle(harness.service);
+    await expectWriterReleased(harness, project);
+  });
+
   it("fails the session closed when a server request cannot be correlated", async () => {
     const harness = await createHarness("execution-uncorrelated-after-two");
     const projects = await Promise.all([
@@ -2197,5 +2417,28 @@ describe("internal controlled Codex execution", () => {
     expect(record.state).toBe("interrupted");
     expect(record.turn_count).toBe(1);
     expect(await traceMethods(harness)).not.toContain("thread/unsubscribe");
+  });
+
+  it("settles a running task when the App Server process exits", async () => {
+    const harness = await createHarness("process-death-held-stdio");
+    const project = await registerGitProject(
+      harness,
+      "process-death-held-stdio-project",
+    );
+    const allocation = await harness.service.startTask({
+      project_id: project.id,
+      prompt: "This turn's App Server process will exit unexpectedly.",
+    });
+
+    const record = await waitForTerminal(harness.runtime, allocation.task_id);
+    expect(record.state).toBe("interrupted");
+    expect(record.turn_count).toBe(1);
+    expect(harness.childLifecycles.at(-1)?.exitObserved).toBe(true);
+    expect(await readStdioHolderPids(harness.tracePath)).toHaveLength(1);
+    expect(harness.service.activeCount).toBe(0);
+    await expectWriterReleased(harness, project);
+    expect(
+      (await traceMethods(harness)).filter((method) => method === "turn/start"),
+    ).toHaveLength(1);
   });
 });

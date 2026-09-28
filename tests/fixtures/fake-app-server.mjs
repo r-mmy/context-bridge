@@ -1,4 +1,5 @@
 import { appendFileSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
 import path from "node:path";
 import process from "node:process";
 import { setInterval, setTimeout } from "node:timers";
@@ -29,6 +30,15 @@ function send(value) {
 function accountResult() {
   if (mode === "auth-absent") {
     return { account: null, requiresOpenaiAuth: true };
+  }
+  if (mode === "malformed-account-type") {
+    return { account: { type: "" }, requiresOpenaiAuth: true };
+  }
+  if (mode === "unsupported-account-type") {
+    return { account: { type: "private-account-sentinel" } };
+  }
+  if (mode === "oversized-account-type") {
+    return { account: { type: "a".repeat(513) } };
   }
   return {
     account: {
@@ -102,6 +112,9 @@ function processRequest(request) {
     });
     const complete = pendingUserInputResponses.get(request.id);
     pendingUserInputResponses.delete(request.id);
+    if (mode === "execution-answer-exit-after-forward" && request.result) {
+      process.exit(29);
+    }
     if (request.result && complete) {
       if (mode === "execution-server-request-fast") complete();
       else setTimeout(complete, 5);
@@ -126,12 +139,15 @@ function processRequest(request) {
     record({
       kind: "environment-check",
       hasOpenAiKey: Object.hasOwn(process.env, "OPENAI_API_KEY"),
+      hasAnthropicKey: Object.hasOwn(process.env, "ANTHROPIC_API_KEY"),
+      hasGithubToken: Object.hasOwn(process.env, "GITHUB_TOKEN"),
       hasCodexKey: Object.hasOwn(process.env, "CODEX_API_KEY"),
       hasTunnelSecret: Object.hasOwn(process.env, "SECURE_MCP_TUNNEL_TOKEN"),
       hasContextBridgeSecret: Object.hasOwn(
         process.env,
         "CONTEXTBRIDGE_SECRET",
       ),
+      hasArbitrarySecret: Object.hasOwn(process.env, "ARBITRARY_APP_SECRET"),
     });
     if (mode === "malformed-json") {
       process.stdout.write("{malformed-json\n");
@@ -331,6 +347,47 @@ function processRequest(request) {
     if (mode === "wrong-thread-roots") {
       response.result.runtimeWorkspaceRoots = [];
     }
+    if (mode === "thread-wrong-id") {
+      response.result.thread.id = "PRIVATE_THREAD_ID_SENTINEL\n";
+    }
+    if (mode === "thread-missing-id") delete response.result.thread.id;
+    if (mode === "thread-wrong-model") response.result.model = "gpt-6-sol";
+    if (mode === "thread-wrong-cwd")
+      response.result.cwd = `${params.cwd}-wrong`;
+    if (mode === "thread-missing-cwd") delete response.result.cwd;
+    if (mode === "thread-missing-roots") {
+      delete response.result.runtimeWorkspaceRoots;
+    }
+    if (mode === "thread-wrong-approval") {
+      response.result.approvalPolicy = "on-request";
+    }
+    if (mode === "thread-wrong-sandbox") {
+      response.result.sandbox.type = "dangerFullAccess";
+    }
+    if (mode === "thread-wrong-writable-roots") {
+      response.result.sandbox.writableRoots = [`${root}-wrong`];
+    }
+    if (mode === "thread-missing-writable-roots") {
+      delete response.result.sandbox.writableRoots;
+    }
+    if (mode === "thread-empty-writable-roots") {
+      response.result.sandbox.writableRoots = [];
+    }
+    if (mode === "thread-network-enabled") {
+      response.result.sandbox.networkAccess = true;
+    }
+    if (mode === "thread-missing-network") {
+      delete response.result.sandbox.networkAccess;
+    }
+    if (mode === "thread-wrong-provider") {
+      response.result.modelProvider = "unexpected-provider";
+    }
+    if (mode === "thread-oversized-provider") {
+      response.result.modelProvider = "x".repeat(129);
+    }
+    if (mode === "thread-missing-approvals-reviewer") {
+      delete response.result.approvalsReviewer;
+    }
     send(response);
     return;
   }
@@ -393,6 +450,24 @@ function processRequest(request) {
     if (mode === "resume-wrong-sandbox") {
       result.sandbox = { type: "dangerFullAccess" };
     }
+    if (mode === "resume-wrong-writable-roots") {
+      result.sandbox.writableRoots = [`${params.cwd}-wrong`];
+    }
+    if (mode === "resume-missing-writable-roots") {
+      delete result.sandbox.writableRoots;
+    }
+    if (mode === "resume-empty-writable-roots") {
+      result.sandbox.writableRoots = [];
+    }
+    if (mode === "resume-network-enabled") {
+      result.sandbox.networkAccess = true;
+    }
+    if (mode === "resume-missing-network") {
+      delete result.sandbox.networkAccess;
+    }
+    if (mode === "resume-wrong-provider") {
+      result.modelProvider = "unexpected-provider";
+    }
     send({ id: request.id, result });
     return;
   }
@@ -434,6 +509,22 @@ function processRequest(request) {
       return;
     }
     if (mode === "turn-start-lost-response") process.exit(24);
+    if (mode === "malformed-turn-id") {
+      send({
+        id: request.id,
+        result: {
+          turn: { id: "PRIVATE_TURN_ID_SENTINEL\n", status: "inProgress" },
+        },
+      });
+      return;
+    }
+    if (mode === "malformed-turn-status") {
+      send({
+        id: request.id,
+        result: { turn: { id: executionTurnId, status: "future-state" } },
+      });
+      return;
+    }
     if (
       mode === "terminal-start-result" ||
       mode === "terminal-start-result-with-notification"
@@ -676,6 +767,20 @@ function processRequest(request) {
       setTimeout(() => process.exit(23), 10);
       return;
     }
+    if (mode === "process-death-held-stdio") {
+      send({
+        id: request.id,
+        result: { turn: { id: executionTurnId, status: "inProgress" } },
+      });
+      const holder = spawn(
+        process.execPath,
+        ["-e", "setInterval(() => undefined, 1000)"],
+        { stdio: ["ignore", 1, 2], windowsHide: true },
+      );
+      record({ kind: "stdio-holder", pid: holder.pid });
+      process.exit(23);
+      return;
+    }
     send({
       id: request.id,
       result: { turn: { id: executionTurnId, status: "inProgress" } },
@@ -847,6 +952,7 @@ function processRequest(request) {
       "execution-server-request",
       "execution-server-request-fast",
       "execution-server-request-single",
+      "execution-answer-exit-after-forward",
       "execution-secret-request",
       "execution-nonblocking-request",
       "execution-second-request",
@@ -968,6 +1074,7 @@ function processRequest(request) {
       mode === "execution-server-request" ||
       mode === "execution-server-request-fast" ||
       mode === "execution-server-request-single" ||
+      mode === "execution-answer-exit-after-forward" ||
       mode === "execution-secret-request" ||
       mode === "execution-nonblocking-request" ||
       mode === "execution-second-request" ||

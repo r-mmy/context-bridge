@@ -19,3 +19,19 @@ Successful tool results include the same JSON object in both `structuredContent`
 ## Future releases
 
 Agent execution and orchestration are outside v0.1. The current package does not define an `AgentAdapter`, invoke Codex, or expose a generic command runner.
+
+## v0.2 Codex task boundary
+
+The v0.2 task subsystem is a separate, explicitly authorized stdio capability.
+It launches only the managed, version-pinned Codex App Server and reasserts the
+registered workspace root, workspace-write sandbox, disabled network, and
+approval-never policy for each turn. The existing v0.1 inspection tools remain
+read-only, and the HTTP MCP surface exposes no task operations. Agent writes
+are performed directly by Codex under its runtime and operating-system
+sandbox; the v0.1 path denylist does not filter Codex reads.
+
+The 0.157.1 App Server and native Codex Desktop use project registries that did
+not share project identity or state in the spike. Context Bridge therefore
+keeps v0.2 App Server threads projectless and does not attempt sidebar
+association. This affects Desktop grouping only; native Desktop can still
+show and use the threads, including same-thread continuation.

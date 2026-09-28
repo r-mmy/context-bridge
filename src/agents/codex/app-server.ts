@@ -192,13 +192,23 @@ class AppServerSession {
     child.on("error", (error: NodeJS.ErrnoException) => {
       this.fail(safeAgentAdapterError(error));
     });
-    child.on("close", () => {
+    const observeChildEnd = () => {
+      if (this.closedState) return;
       this.closedState = true;
       this.resolveClosed();
       if (!this.stopping) {
         this.fail(new AgentAdapterError("app_server_exited"));
       }
-    });
+      // A runtime launcher may leave descendants holding inherited stdio
+      // handles after the App Server process exits. No further protocol data
+      // is trustworthy once that process is gone, and destroying these local
+      // streams lets the session unload without waiting for those handles.
+      this.child.stdin.destroy();
+      this.child.stdout.destroy();
+      this.child.stderr.destroy();
+    };
+    child.on("exit", observeChildEnd);
+    child.on("close", observeChildEnd);
   }
 
   get isUsable(): boolean {

@@ -186,6 +186,8 @@ class MemoryTaskHost implements TaskToolHost {
   }> = [];
   waitError: unknown = undefined;
   waitUpdate = false;
+  waitUpdateState: "completed" | "waiting_for_input" = "completed";
+  waitRegistrationStale = false;
   listResult: TaskRecordPage | undefined;
   private readonly requests = new Map<
     string,
@@ -297,25 +299,34 @@ class MemoryTaskHost implements TaskToolHost {
     });
     if (this.waitError) throw this.waitError;
     if (this.waitUpdate) {
-      this.record.state = "completed";
-      this.record.turns[0]!.state = "completed";
-      this.record.turns[0]!.completed_at = NOW;
-      this.record.final_response = {
-        text: "safe completed response",
-        truncated: false,
-      };
-      this.record.turns[0]!.final_response = this.record.final_response;
+      const nextState = this.waitUpdateState;
+      this.record.state = nextState;
+      this.record.turns[0]!.state = nextState;
+      this.record.turns[0]!.completed_at =
+        nextState === "completed" ? NOW : null;
+      if (nextState === "waiting_for_input") {
+        this.record.pending_input = makePendingInput();
+      } else {
+        this.record.final_response = {
+          text: "safe completed response",
+          truncated: false,
+        };
+        this.record.turns[0]!.final_response = this.record.final_response;
+      }
       this.record.event_seq += 1;
       this.record.events.push(
         makeEvent(
           this.record.event_seq,
-          "turn",
-          "state_changed",
-          "completed",
+          nextState === "waiting_for_input" ? "input" : "turn",
+          nextState === "waiting_for_input" ? "activity" : "state_changed",
+          nextState,
           1,
         ),
       );
       this.waitUpdate = false;
+      if (this.waitRegistrationStale) {
+        this.getError = new TaskError("task_registration_stale");
+      }
     }
     return structuredClone(this.record);
   }
@@ -1039,6 +1050,51 @@ describe("public task MCP façade", () => {
       expect(
         structured<z.infer<typeof TaskGetOutputSchema>>(result).state,
       ).toBe("running");
+    });
+
+    const inputWaitHost = new MemoryTaskHost();
+    inputWaitHost.record = makeRecord({ events: [] });
+    inputWaitHost.record.event_seq = 0;
+    inputWaitHost.waitUpdate = true;
+    inputWaitHost.waitUpdateState = "waiting_for_input";
+    await withClient(inputWaitHost, async (client) => {
+      const result = await client.callTool({
+        name: "task_get",
+        arguments: {
+          task_id: inputWaitHost.record.task_id,
+          after_seq: 0,
+          wait_ms: 300,
+        },
+      });
+      expect(
+        structured<z.infer<typeof TaskGetOutputSchema>>(result),
+      ).toMatchObject({
+        state: "waiting_for_input",
+        pending_input: expect.any(Object),
+      });
+    });
+
+    const staleRegistrationHost = new MemoryTaskHost();
+    staleRegistrationHost.record = makeRecord({ events: [] });
+    staleRegistrationHost.record.event_seq = 0;
+    staleRegistrationHost.waitUpdate = true;
+    staleRegistrationHost.waitRegistrationStale = true;
+    await withClient(staleRegistrationHost, async (client) => {
+      const result = await client.callTool({
+        name: "task_get",
+        arguments: {
+          task_id: staleRegistrationHost.record.task_id,
+          after_seq: 0,
+          wait_ms: 300,
+        },
+      });
+      expect(textError(result)).toEqual({
+        code: "task_registration_stale",
+        message:
+          "The task is not available for the current project registration.",
+        retryable: false,
+      });
+      expect(staleRegistrationHost.waitCalls).toHaveLength(1);
     });
   });
 

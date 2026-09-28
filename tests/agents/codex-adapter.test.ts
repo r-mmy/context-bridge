@@ -1,7 +1,9 @@
 import { spawn } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { PassThrough, Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import type {
   ChildProcessWithoutNullStreams,
@@ -28,9 +30,12 @@ interface TraceEntry {
   params?: Record<string, unknown>;
   kind?: string;
   hasOpenAiKey?: boolean;
+  hasAnthropicKey?: boolean;
+  hasGithubToken?: boolean;
   hasCodexKey?: boolean;
   hasTunnelSecret?: boolean;
   hasContextBridgeSecret?: boolean;
+  hasArbitrarySecret?: boolean;
 }
 
 interface SpawnRecord {
@@ -54,6 +59,7 @@ async function createHarness(
   overrides: {
     requestTimeoutMs?: number;
     shutdownTimeoutMs?: number;
+    exitWithoutStreamEnd?: boolean;
     throwOnSpawn?: NodeJS.ErrnoException;
     runtime?: CodexRuntime | null;
     runtimeError?: Error;
@@ -90,9 +96,12 @@ async function createHarness(
     LANG: "C.UTF-8",
     LC_ALL: "C.UTF-8",
     OPENAI_API_KEY: "fake-openai-secret-for-test",
+    ANTHROPIC_API_KEY: "fake-anthropic-secret-for-test",
+    GITHUB_TOKEN: "fake-github-secret-for-test",
     CODEX_API_KEY: "fake-codex-secret-for-test",
     SECURE_MCP_TUNNEL_TOKEN: "fake-tunnel-secret-for-test",
     CONTEXTBRIDGE_SECRET: "fake-context-bridge-secret-for-test",
+    ARBITRARY_APP_SECRET: "fake-arbitrary-app-secret-for-test",
   };
   let launchIndex = 0;
   const adapter = new CodexAgentAdapter({
@@ -135,6 +144,11 @@ async function createHarness(
           ? mode
           : mode(launchIndex);
       if (!isVersionQuery) launchIndex += 1;
+      if (!isVersionQuery && overrides.exitWithoutStreamEnd) {
+        const child = createExitWithoutStreamEndChild();
+        children.push(child);
+        return child;
+      }
       const child = spawn(
         process.execPath,
         [
@@ -163,6 +177,56 @@ async function createHarness(
     children,
     sourceEnvironment,
   };
+}
+
+function createExitWithoutStreamEndChild(): ChildProcessWithoutNullStreams {
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+  const child = new EventEmitter() as unknown as ChildProcessWithoutNullStreams;
+  let input = "";
+  const stdin = new Writable({
+    write(chunk, _encoding, callback) {
+      input += Buffer.isBuffer(chunk) ? chunk.toString("utf8") : chunk;
+      while (true) {
+        const newline = input.indexOf("\n");
+        if (newline < 0) break;
+        const request = JSON.parse(input.slice(0, newline)) as {
+          id?: number;
+          method?: string;
+        };
+        input = input.slice(newline + 1);
+        if (request.method === "initialize") {
+          stdout.write(
+            `${JSON.stringify({
+              id: request.id,
+              result: {
+                userAgent: "codex_cli_rs/0.157.1",
+                platformFamily: "windows",
+                platformOs: "windows",
+                serverInfo: { version: "0.157.1" },
+              },
+            })}\n`,
+          );
+        } else if (request.method === "account/read") {
+          setImmediate(() => {
+            Object.defineProperty(child, "exitCode", { value: 23 });
+            child.emit("exit", 23, null);
+          });
+        }
+      }
+      callback();
+    },
+  });
+  Object.assign(child, {
+    stdin,
+    stdout,
+    stderr,
+    pid: 12345,
+    exitCode: null,
+    signalCode: null,
+    kill: () => true,
+  });
+  return child;
 }
 
 afterEach(async () => {
@@ -369,6 +433,77 @@ describe("Codex App Server adapter", () => {
   });
 
   it.each([
+    "thread-wrong-id",
+    "thread-missing-id",
+    "thread-wrong-model",
+    "thread-wrong-cwd",
+    "thread-missing-cwd",
+    "thread-missing-roots",
+    "wrong-thread-roots",
+    "thread-wrong-approval",
+    "thread-wrong-sandbox",
+    "thread-wrong-writable-roots",
+    "thread-network-enabled",
+    "thread-missing-network",
+    "thread-wrong-provider",
+    "thread-oversized-provider",
+    "thread-missing-approvals-reviewer",
+  ])("fails closed for hostile %s thread/start response", async (mode) => {
+    const harness = await createHarness(mode);
+    const root = path.join(harness.directory, "workspace");
+    await mkdir(root);
+    await harness.adapter.start();
+    const error = await harness.adapter
+      .startThread({ root, model: "gpt-6-luna" })
+      .catch((caught: unknown) => caught);
+    expect(error).toMatchObject({ code: "app_server_incompatible" });
+    expect(String(error)).not.toContain("PRIVATE_THREAD_ID_SENTINEL");
+    const trace = await readTrace(harness.tracePath);
+    expect(trace.some((entry) => entry.method === "turn/start")).toBe(false);
+    const child = harness.children.at(-1);
+    expect(child?.exitCode !== null || child?.signalCode !== null).toBe(true);
+    await harness.adapter.close();
+  });
+
+  it.each(["thread-missing-writable-roots", "thread-empty-writable-roots"])(
+    "keeps the explicit one-root turn policy when thread/start reports %s",
+    async (mode) => {
+      const harness = await createHarness(mode);
+      const root = path.join(harness.directory, "workspace");
+      await mkdir(root);
+      await harness.adapter.start();
+      const thread = await harness.adapter.startThread({
+        root,
+        model: "gpt-6-luna",
+      });
+      await harness.adapter.startTurn({
+        threadId: thread.threadId,
+        root,
+        model: "gpt-6-luna",
+        effort: "max",
+        prompt: "Harmless adapter fixture.",
+        mode: "default",
+      });
+      const request = (await readTrace(harness.tracePath)).find(
+        (entry) => entry.method === "turn/start",
+      );
+      expect(request?.params).toMatchObject({
+        cwd: root,
+        runtimeWorkspaceRoots: [root],
+        approvalPolicy: "never",
+        sandboxPolicy: {
+          type: "workspaceWrite",
+          writableRoots: [root],
+          networkAccess: false,
+          excludeTmpdirEnvVar: true,
+          excludeSlashTmp: true,
+        },
+      });
+      await harness.adapter.close();
+    },
+  );
+
+  it.each([
     "resume-wrong-thread",
     "resume-wrong-model",
     "resume-wrong-cwd",
@@ -377,6 +512,10 @@ describe("Codex App Server adapter", () => {
     "resume-missing-roots",
     "resume-wrong-approval",
     "resume-wrong-sandbox",
+    "resume-wrong-writable-roots",
+    "resume-network-enabled",
+    "resume-missing-network",
+    "resume-wrong-provider",
   ])("rejects a %s thread/resume response", async (mode) => {
     const harness = await createHarness(mode);
     await harness.adapter.start();
@@ -395,6 +534,75 @@ describe("Codex App Server adapter", () => {
     expect(methods).not.toContain("turn/start");
     await harness.adapter.close();
   });
+
+  it.each(["resume-missing-writable-roots", "resume-empty-writable-roots"])(
+    "reasserts the one-root turn policy when thread/resume reports %s",
+    async (mode) => {
+      const harness = await createHarness(mode);
+      const root = path.join(harness.directory, "workspace");
+      await mkdir(root);
+      const threadId = "private-thread-for-resume-test";
+      await harness.adapter.start();
+      await expect(
+        harness.adapter.resumeThread({
+          threadId,
+          root,
+          model: "gpt-6-luna",
+        }),
+      ).resolves.toEqual({ threadId });
+      await harness.adapter.startTurn({
+        threadId,
+        root,
+        model: "gpt-6-luna",
+        effort: "max",
+        prompt: "Harmless adapter fixture.",
+        mode: "default",
+      });
+      const request = (await readTrace(harness.tracePath)).find(
+        (entry) => entry.method === "turn/start",
+      );
+      expect(request?.params).toMatchObject({
+        cwd: root,
+        runtimeWorkspaceRoots: [root],
+        approvalPolicy: "never",
+        sandboxPolicy: {
+          type: "workspaceWrite",
+          writableRoots: [root],
+          networkAccess: false,
+          excludeTmpdirEnvVar: true,
+          excludeSlashTmp: true,
+        },
+      });
+      await harness.adapter.close();
+    },
+  );
+
+  it.each(["malformed-turn-id", "malformed-turn-status"])(
+    "rejects %s turn/start response data",
+    async (mode) => {
+      const harness = await createHarness(mode);
+      const root = path.join(harness.directory, "workspace");
+      await mkdir(root);
+      await harness.adapter.start();
+      const thread = await harness.adapter.startThread({
+        root,
+        model: "gpt-6-luna",
+      });
+      const error = await harness.adapter
+        .startTurn({
+          threadId: thread.threadId,
+          root,
+          model: "gpt-6-luna",
+          effort: "max",
+          prompt: "Harmless adapter fixture.",
+          mode: "default",
+        })
+        .catch((caught: unknown) => caught);
+      expect(error).toMatchObject({ code: "app_server_incompatible" });
+      expect(String(error)).not.toContain("PRIVATE_TURN_ID_SENTINEL");
+      await harness.adapter.close();
+    },
+  );
 
   it("passes only the platform allowlist and derives CODEX_HOME without inheriting secrets", async () => {
     const harness = await createHarness();
@@ -419,9 +627,12 @@ describe("Codex App Server adapter", () => {
       path.join(harness.directory, "home", ".codex"),
     );
     expect(childEnvironment.OPENAI_API_KEY).toBeUndefined();
+    expect(childEnvironment.ANTHROPIC_API_KEY).toBeUndefined();
+    expect(childEnvironment.GITHUB_TOKEN).toBeUndefined();
     expect(childEnvironment.CODEX_API_KEY).toBeUndefined();
     expect(childEnvironment.SECURE_MCP_TUNNEL_TOKEN).toBeUndefined();
     expect(childEnvironment.CONTEXTBRIDGE_SECRET).toBeUndefined();
+    expect(childEnvironment.ARBITRARY_APP_SECRET).toBeUndefined();
 
     await harness.adapter.close();
     const environmentTrace = (await readTrace(harness.tracePath)).find(
@@ -429,9 +640,12 @@ describe("Codex App Server adapter", () => {
     );
     expect(environmentTrace).toMatchObject({
       hasOpenAiKey: false,
+      hasAnthropicKey: false,
+      hasGithubToken: false,
       hasCodexKey: false,
       hasTunnelSecret: false,
       hasContextBridgeSecret: false,
+      hasArbitrarySecret: false,
     });
   });
 
@@ -501,6 +715,21 @@ describe("Codex App Server adapter", () => {
         message: expect.not.stringContaining("private-account-identity"),
       },
     );
+    await harness.adapter.close();
+  });
+
+  it.each([
+    "malformed-account-type",
+    "unsupported-account-type",
+    "oversized-account-type",
+  ])("rejects malformed account/read data from %s", async (mode) => {
+    const harness = await createHarness(mode);
+    await harness.adapter.start();
+    const error = await harness.adapter
+      .checkAuthentication()
+      .catch((caught: unknown) => caught);
+    expect(error).toMatchObject({ code: "app_server_incompatible" });
+    expect(String(error)).not.toContain("private-account-sentinel");
     await harness.adapter.close();
   });
 
@@ -629,6 +858,19 @@ describe("Codex App Server adapter", () => {
     const dead = await createHarness("exit-account", {
       requestTimeoutMs: 500,
       shutdownTimeoutMs: 20,
+    });
+    await dead.adapter.start();
+    await expect(dead.adapter.checkAuthentication()).rejects.toMatchObject({
+      code: "app_server_exited",
+    });
+    await dead.adapter.close();
+  });
+
+  it("fails a pending request on process exit even if stdio close is delayed", async () => {
+    const dead = await createHarness("normal", {
+      requestTimeoutMs: 1_000,
+      shutdownTimeoutMs: 20,
+      exitWithoutStreamEnd: true,
     });
     await dead.adapter.start();
     await expect(dead.adapter.checkAuthentication()).rejects.toMatchObject({

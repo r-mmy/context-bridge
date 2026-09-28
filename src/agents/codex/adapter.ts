@@ -25,6 +25,8 @@ const TOKEN_FIELDS = [
   ["reasoningOutputTokens", "reasoning_output_tokens"],
   ["totalTokens", "total_tokens"],
 ] as const;
+const SUPPORTED_ACCOUNT_TYPES = new Set(["chatgpt", "apiKey"]);
+const CODEX_MODEL_PROVIDER = "openai";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -43,6 +45,23 @@ function boundedText(value: unknown, maxLength: number): value is string {
     }
   }
   return true;
+}
+
+function isBoundedProtocolIdentifier(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= 512 &&
+    /^[\x21-\x7e]+$/.test(value)
+  );
+}
+
+function writableRootsConflict(value: unknown, expectedRoot: string): boolean {
+  if (value === undefined) return false;
+  if (!Array.isArray(value) || value.some((root) => typeof root !== "string")) {
+    return true;
+  }
+  return value.length > 0 && (value.length !== 1 || value[0] !== expectedRoot);
 }
 
 function parseTokenBreakdown(value: unknown): TokenBreakdown | undefined {
@@ -250,7 +269,12 @@ export class CodexAgentAdapter implements AgentExecutionAdapter {
       throw new AgentAdapterError("app_server_incompatible");
     }
     if (result.account === null) return false;
-    if (!isRecord(result.account) || typeof result.account.type !== "string") {
+    if (
+      !isRecord(result.account) ||
+      typeof result.account.type !== "string" ||
+      result.account.type.length > 32 ||
+      !SUPPORTED_ACCOUNT_TYPES.has(result.account.type)
+    ) {
       throw new AgentAdapterError("app_server_incompatible");
     }
     return true;
@@ -478,46 +502,40 @@ export class CodexAgentAdapter implements AgentExecutionAdapter {
       approvalPolicy: "never",
       sandbox: "workspace-write",
     });
+    const threadId =
+      isRecord(result) && isRecord(result.thread)
+        ? result.thread.id
+        : undefined;
     const sandbox =
       isRecord(result) && isRecord(result.sandbox) ? result.sandbox : undefined;
     const writableRoots = sandbox?.writableRoots;
-    const invalidWritableRoots =
-      writableRoots !== undefined &&
-      (!Array.isArray(writableRoots) ||
-        writableRoots.some((root) => typeof root !== "string") ||
-        (Array.isArray(writableRoots) &&
-          writableRoots.length > 0 &&
-          (writableRoots.length !== 1 || writableRoots[0] !== input.root)));
-    if (
+    const invalidStart =
       !isRecord(result) ||
       !isRecord(result.thread) ||
-      typeof result.thread.id !== "string" ||
-      result.thread.id.length === 0 ||
-      result.thread.id.length > 512 ||
       result.model !== input.model ||
       result.cwd !== input.root ||
       result.approvalPolicy !== "never" ||
       !sandbox ||
       sandbox.type !== "workspaceWrite" ||
-      (sandbox.networkAccess !== undefined &&
-        typeof sandbox.networkAccess !== "boolean") ||
-      sandbox.networkAccess === true ||
+      sandbox.networkAccess !== false ||
+      writableRootsConflict(writableRoots, input.root) ||
       (sandbox.excludeTmpdirEnvVar !== undefined &&
         typeof sandbox.excludeTmpdirEnvVar !== "boolean") ||
       (sandbox.excludeSlashTmp !== undefined &&
         typeof sandbox.excludeSlashTmp !== "boolean") ||
-      invalidWritableRoots ||
       !Array.isArray(result.runtimeWorkspaceRoots) ||
       result.runtimeWorkspaceRoots.length !== 1 ||
       result.runtimeWorkspaceRoots[0] !== input.root ||
-      typeof result.modelProvider !== "string" ||
-      result.modelProvider.length === 0 ||
-      result.modelProvider.length > 128 ||
-      !Object.hasOwn(result, "approvalsReviewer")
-    ) {
+      result.modelProvider !== CODEX_MODEL_PROVIDER ||
+      !Object.hasOwn(result, "approvalsReviewer");
+    if (invalidStart || !isBoundedProtocolIdentifier(threadId)) {
+      // A successful response may have opened a subscription even when its
+      // effective sandbox is unusable. The returned thread ID is untrusted,
+      // so close this session instead of attempting to unsubscribe it.
+      await this.close().catch(() => undefined);
       throw new AgentAdapterError("app_server_incompatible");
     }
-    return { threadId: result.thread.id };
+    return { threadId };
   }
 
   async resumeThread(input: {
@@ -537,13 +555,6 @@ export class CodexAgentAdapter implements AgentExecutionAdapter {
     const sandbox =
       isRecord(result) && isRecord(result.sandbox) ? result.sandbox : undefined;
     const writableRoots = sandbox?.writableRoots;
-    const invalidWritableRoots =
-      writableRoots !== undefined &&
-      (!Array.isArray(writableRoots) ||
-        writableRoots.some((root) => typeof root !== "string") ||
-        (Array.isArray(writableRoots) &&
-          writableRoots.length > 0 &&
-          (writableRoots.length !== 1 || writableRoots[0] !== input.root)));
     const invalidResume =
       !isRecord(result) ||
       !isRecord(result.thread) ||
@@ -553,20 +564,16 @@ export class CodexAgentAdapter implements AgentExecutionAdapter {
       result.approvalPolicy !== "never" ||
       !sandbox ||
       sandbox.type !== "workspaceWrite" ||
-      (sandbox.networkAccess !== undefined &&
-        typeof sandbox.networkAccess !== "boolean") ||
-      sandbox.networkAccess === true ||
+      sandbox.networkAccess !== false ||
+      writableRootsConflict(writableRoots, input.root) ||
       (sandbox.excludeTmpdirEnvVar !== undefined &&
         typeof sandbox.excludeTmpdirEnvVar !== "boolean") ||
       (sandbox.excludeSlashTmp !== undefined &&
         typeof sandbox.excludeSlashTmp !== "boolean") ||
-      invalidWritableRoots ||
       !Array.isArray(result.runtimeWorkspaceRoots) ||
       result.runtimeWorkspaceRoots.length !== 1 ||
       result.runtimeWorkspaceRoots[0] !== input.root ||
-      typeof result.modelProvider !== "string" ||
-      result.modelProvider.length === 0 ||
-      result.modelProvider.length > 128 ||
+      result.modelProvider !== CODEX_MODEL_PROVIDER ||
       !Object.hasOwn(result, "approvalsReviewer");
     if (invalidResume) {
       // A successful RPC may have subscribed the requested thread even when
@@ -618,9 +625,7 @@ export class CodexAgentAdapter implements AgentExecutionAdapter {
     if (
       !isRecord(result) ||
       !isRecord(result.turn) ||
-      typeof result.turn.id !== "string" ||
-      result.turn.id.length === 0 ||
-      result.turn.id.length > 512 ||
+      !isBoundedProtocolIdentifier(result.turn.id) ||
       !["completed", "interrupted", "failed", "inProgress"].includes(
         String(result.turn.status),
       )
@@ -715,9 +720,7 @@ export class CodexAgentAdapter implements AgentExecutionAdapter {
 }
 
 function boundedIdentifier(value: unknown): string | undefined {
-  return typeof value === "string" && value.length > 0 && value.length <= 512
-    ? value
-    : undefined;
+  return isBoundedProtocolIdentifier(value) ? value : undefined;
 }
 
 let sharedCodexAdapter: CodexAgentAdapter | undefined;
