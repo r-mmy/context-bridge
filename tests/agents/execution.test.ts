@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
@@ -43,6 +43,7 @@ const cleanups: Array<() => Promise<void>> = [];
 interface Harness {
   root: string;
   tracePath: string;
+  children: ChildProcessWithoutNullStreams[];
   projects: ProjectRecord[];
   runtime: TaskRuntime;
   service: AgentExecutionService;
@@ -134,7 +135,7 @@ async function createHarness(
     else process.env.HOME = prior.home;
     await rm(root, { recursive: true, force: true });
   });
-  return { root, tracePath, projects, runtime, service };
+  return { root, tracePath, children, projects, runtime, service };
 }
 
 async function registerGitProject(
@@ -168,6 +169,32 @@ async function waitForTerminal(
   ) {
     if (Date.now() > deadline)
       throw new Error("test task did not become terminal");
+    if (record.state === "waiting_for_input") {
+      await new Promise<void>((resolve) => setTimeout(resolve, 20));
+      record = await runtime.manager.getTask(taskId);
+    } else {
+      record = await runtime.manager.waitForTask(
+        taskId,
+        record.event_seq,
+        1_000,
+      );
+    }
+  }
+  return record;
+}
+
+async function waitForPendingInput(
+  runtime: TaskRuntime,
+  taskId: string,
+): Promise<TaskRecord> {
+  let record = await runtime.manager.getTask(taskId);
+  const deadline = Date.now() + 10_000;
+  while (
+    !record.pending_input &&
+    !["failed", "interrupted", "cancelled"].includes(record.state)
+  ) {
+    if (Date.now() > deadline)
+      throw new Error("task did not request user input");
     record = await runtime.manager.waitForTask(taskId, record.event_seq, 1_000);
   }
   return record;
@@ -211,6 +238,12 @@ async function expectWriterReleased(
   expect(harness.service.activeCount).toBe(0);
   const lock = await waitForProjectWriterLock(project);
   await lock.release();
+}
+
+async function expectWriterHeld(project: ProjectRecord): Promise<void> {
+  const lock = await tryAcquireProjectWriterLock(project.root);
+  expect(lock).toBeFalsy();
+  if (lock) await lock.release();
 }
 
 async function expectPreAcceptanceFailure(
@@ -1425,22 +1458,354 @@ describe("internal controlled Codex execution", () => {
     await expectWriterReleased(harness, terminalProject);
   });
 
-  it("fails an active turn on an unexpected correlated server request without saving its payload", async () => {
-    const harness = await createHarness("execution-server-request");
+  it("relays bounded multi-question input and continues the same default and Plan turns", async () => {
+    const harness = await createHarness("execution-server-request-fast");
     const project = await registerGitProject(harness, "server-request-project");
     const allocation = await harness.service.startTask({
       project_id: project.id,
-      prompt: "Do not ask for more input.",
+      prompt: "Ask the user before continuing.",
+    });
+    const waiting = await waitForPendingInput(
+      harness.runtime,
+      allocation.task_id,
+    );
+    expect(waiting.state).toBe("waiting_for_input");
+    expect(waiting.pending_input?.questions).toHaveLength(4);
+    expect(waiting.pending_input?.questions[0]).toMatchObject({
+      question_id: "choice",
+      is_other: false,
+      options: [
+        { label: "Proceed", description: "Continue the same turn." },
+        { label: "Wait", description: "Keep waiting." },
+      ],
+    });
+    expect(waiting.pending_input?.questions[1]).toMatchObject({
+      options: [],
+      is_other: false,
+    });
+    expect(waiting.pending_input?.questions[2]?.is_other).toBe(true);
+    expect(waiting.pending_input?.questions[3]?.question_id).toBe("__proto__");
+    expect(harness.service.activeCount).toBe(1);
+    await expectWriterHeld(project);
+
+    const pendingId = waiting.pending_input!.pending_input_id;
+    await expect(
+      harness.service.answerUserInput({
+        task_id: allocation.task_id,
+        pending_input_id: randomUUID(),
+        answers: [{ question_id: "choice", answers: ["Proceed"] }],
+      }),
+    ).rejects.toMatchObject({ code: "pending_input_stale" });
+    const validAnswers = [
+      { question_id: "choice", answers: ["Proceed"] },
+      { question_id: "note", answers: ["approved by the user"] },
+      { question_id: "choice-with-note", answers: ["Proceed", "because"] },
+      { question_id: "__proto__", answers: ["opaque identifier accepted"] },
+    ];
+    const invalidAnswers = [
+      [
+        { question_id: "choice", answers: ["Proceed"] },
+        { question_id: "note", answers: ["approved"] },
+      ],
+      [
+        ...validAnswers.slice(0, 2),
+        { question_id: "unknown", answers: ["extra"] },
+      ],
+      [
+        { question_id: "choice", answers: ["Proceed"] },
+        { question_id: "choice", answers: ["Wait"] },
+        ...validAnswers.slice(1),
+      ],
+      [
+        { question_id: "choice", answers: ["not an option"] },
+        ...validAnswers.slice(1),
+      ],
+    ];
+    for (const answers of invalidAnswers) {
+      await expect(
+        harness.service.answerUserInput({
+          task_id: allocation.task_id,
+          pending_input_id: pendingId,
+          answers,
+        }),
+      ).rejects.toMatchObject({ code: "invalid_answers" });
+    }
+    expect(
+      (await harness.runtime.manager.getTask(allocation.task_id)).state,
+    ).toBe("waiting_for_input");
+
+    const answered = await harness.service.answerUserInput({
+      task_id: allocation.task_id,
+      pending_input_id: pendingId,
+      answers: validAnswers,
+    });
+    expect(answered).toMatchObject({ state: "running", turn_number: 1 });
+    await expect(
+      harness.service.answerUserInput({
+        task_id: allocation.task_id,
+        pending_input_id: pendingId,
+        answers: validAnswers,
+      }),
+    ).rejects.toMatchObject({ code: "pending_input_stale" });
+    const firstTerminal = await waitForTerminal(
+      harness.runtime,
+      allocation.task_id,
+    );
+    expect(firstTerminal.turn_count).toBe(1);
+    expect(firstTerminal.turns[0]).toMatchObject({
+      mode: "default",
+      input_wait_count: 1,
+    });
+    expect(firstTerminal.turns[0]!.input_wait_ms).toBeGreaterThanOrEqual(0);
+    expect(
+      firstTerminal.events.filter((event) => event.category === "input").at(-1),
+    ).toMatchObject({
+      kind: "activity",
+      status: "saved",
+      duration_ms: expect.any(Number),
+    });
+    await waitForExecutionIdle(harness.service);
+
+    const continued = await harness.service.continueTask({
+      task_id: allocation.task_id,
+      prompt: "Continue in Plan mode after user input.",
       mode: "plan",
     });
-    const record = await waitForTerminal(harness.runtime, allocation.task_id);
-    expect(record.state).toBe("failed");
-    expect(record.turns[0]?.mode).toBe("plan");
-    expect(JSON.stringify(record)).not.toContain("private question text");
-    expect(JSON.stringify(record)).not.toContain(
+    const secondWaiting = await waitForPendingInput(
+      harness.runtime,
+      allocation.task_id,
+    );
+    expect(secondWaiting.pending_input?.turn_number).toBe(2);
+    const secondId = secondWaiting.pending_input!.pending_input_id;
+    await harness.service.answerUserInput({
+      task_id: allocation.task_id,
+      pending_input_id: secondId,
+      answers: [
+        { question_id: "choice", answers: ["Wait"] },
+        { question_id: "note", answers: ["plan approved"] },
+        { question_id: "choice-with-note", answers: ["free-form other"] },
+        { question_id: "__proto__", answers: ["opaque identifier accepted"] },
+      ],
+    });
+    const final = await waitForTerminal(harness.runtime, allocation.task_id);
+    expect(continued.turn_number).toBe(2);
+    expect(final.turn_count).toBe(2);
+    expect(final.turns[1]).toMatchObject({ mode: "plan", input_wait_count: 1 });
+    expect(final.pending_input).toBeNull();
+    const trace = await readFile(harness.tracePath, "utf8");
+    const records = trace
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    const responses = records.filter(
+      (entry) => entry.kind === "user-input-response",
+    );
+    expect(responses).toHaveLength(2);
+    expect(responses[0]).toMatchObject({
+      id: "ephemeral-private-server-request-id",
+      result: {
+        answers: {
+          choice: { answers: ["Proceed"] },
+          note: { answers: ["approved by the user"] },
+          "choice-with-note": { answers: ["Proceed", "because"] },
+        },
+      },
+    });
+    const firstResponseAnswers = (
+      responses[0]?.result as { answers: Record<string, unknown> } | undefined
+    )?.answers;
+    expect(firstResponseAnswers).toBeDefined();
+    expect(Object.hasOwn(firstResponseAnswers!, "__proto__")).toBe(true);
+    expect(firstResponseAnswers?.["__proto__"]).toEqual({
+      answers: ["opaque identifier accepted"],
+    });
+    expect(
+      records.filter((entry) => entry.method === "turn/start"),
+    ).toHaveLength(2);
+    expect(
+      records.filter((entry) => entry.method === "thread/start"),
+    ).toHaveLength(1);
+    expect(JSON.stringify(final)).not.toContain(
       "ephemeral-private-server-request-id",
     );
-    expect(record.pending_input).toBeNull();
+    expect(JSON.stringify(final)).not.toContain("private-user-input-item");
+    await waitForExecutionIdle(harness.service);
+    await expectWriterReleased(harness, project);
+  });
+
+  it.each(["execution-secret-request", "execution-malformed-secret"])(
+    "suppresses secret questions from %s, interrupts, and requires local action",
+    async (mode) => {
+      const harness = await createHarness(mode);
+      const project = await registerGitProject(harness, `secret-${mode}`);
+      const allocation = await harness.service.startTask({
+        project_id: project.id,
+        prompt: "A secret question must stay local.",
+      });
+      const record = await waitForTerminal(harness.runtime, allocation.task_id);
+      expect(record).toMatchObject({
+        state: "interrupted",
+        local_action_required: true,
+        safe_error: { code: "secret_input_requires_local_action" },
+        pending_input: null,
+      });
+      const serialized = JSON.stringify(record);
+      for (const privateValue of [
+        "PRIVATE secret header",
+        "PRIVATE secret question",
+        "PRIVATE malformed secret question",
+        "PRIVATE secret option",
+        "PRIVATE secret description",
+        "ephemeral-private-server-request-id",
+        "private-user-input-item",
+      ]) {
+        expect(serialized).not.toContain(privateValue);
+      }
+      await expect(
+        harness.service.continueTask({
+          task_id: allocation.task_id,
+          prompt: "Cannot continue the secret-input task.",
+        }),
+      ).rejects.toMatchObject({ code: "task_state_conflict" });
+      const methods = await traceMethods(harness);
+      expect(methods).toContain("turn/interrupt");
+      await waitForExecutionIdle(harness.service);
+      await expectWriterReleased(harness, project);
+    },
+  );
+
+  it("relays a single blocking question without creating a replacement turn", async () => {
+    const harness = await createHarness("execution-server-request-single");
+    const project = await registerGitProject(harness, "single-input-project");
+    const allocation = await harness.service.startTask({
+      project_id: project.id,
+      prompt: "Ask one harmless question before finishing.",
+    });
+    const waiting = await waitForPendingInput(
+      harness.runtime,
+      allocation.task_id,
+    );
+    expect(waiting.pending_input?.questions).toHaveLength(1);
+    const answered = await harness.service.answerUserInput({
+      task_id: allocation.task_id,
+      pending_input_id: waiting.pending_input!.pending_input_id,
+      answers: [{ question_id: "choice", answers: ["Proceed"] }],
+    });
+    expect(answered).toMatchObject({ turn_number: 1, state: "running" });
+    const completed = await waitForTerminal(
+      harness.runtime,
+      allocation.task_id,
+    );
+    expect(completed.state).toBe("completed");
+    expect(completed.turn_count).toBe(1);
+    expect(
+      (await traceMethods(harness)).filter((method) => method === "turn/start"),
+    ).toHaveLength(1);
+    await waitForExecutionIdle(harness.service);
+    await expectWriterReleased(harness, project);
+  });
+
+  it.each([
+    "execution-nonblocking-request",
+    "execution-unsupported-request",
+    "execution-duplicate-question",
+    "execution-too-many-questions",
+    "execution-second-request",
+  ])(
+    "fails closed for %s and does not persist request contents",
+    async (mode) => {
+      const harness = await createHarness(mode);
+      const project = await registerGitProject(harness, `unsupported-${mode}`);
+      const allocation = await harness.service.startTask({
+        project_id: project.id,
+        prompt: "Unsupported user input must fail closed.",
+      });
+      const record = await waitForTerminal(harness.runtime, allocation.task_id);
+      expect(record.state).toBe("failed");
+      expect(record.pending_input).toBeNull();
+      expect(JSON.stringify(record)).not.toContain(
+        "ephemeral-private-server-request-id",
+      );
+      await waitForExecutionIdle(harness.service);
+      await expectWriterReleased(harness, project);
+    },
+  );
+
+  it("rejects and invalidates pending input when the user cancels", async () => {
+    const harness = await createHarness("execution-server-request");
+    const project = await registerGitProject(harness, "cancel-input-project");
+    const allocation = await harness.service.startTask({
+      project_id: project.id,
+      prompt: "Wait for a user answer, then cancel.",
+    });
+    const waiting = await waitForPendingInput(
+      harness.runtime,
+      allocation.task_id,
+    );
+    const pendingId = waiting.pending_input!.pending_input_id;
+    const cancelled = await harness.service.cancelTask(allocation.task_id);
+    expect(cancelled.state).toBe("cancelled");
+    await expect(
+      harness.service.answerUserInput({
+        task_id: allocation.task_id,
+        pending_input_id: pendingId,
+        answers: [{ question_id: "choice", answers: ["Proceed"] }],
+      }),
+    ).rejects.toMatchObject({ code: "pending_input_not_found" });
+    const trace = await readFile(harness.tracePath, "utf8");
+    expect(trace).toContain('"kind":"user-input-response"');
+    expect(trace).toContain('"error":{"code":-32000');
+    await waitForExecutionIdle(harness.service);
+    await expectWriterReleased(harness, project);
+  });
+
+  it("recovers an App Server death while waiting without replaying the private request", async () => {
+    const harness = await createHarness("execution-server-request");
+    const project = await registerGitProject(
+      harness,
+      "input-server-death-project",
+    );
+    const allocation = await harness.service.startTask({
+      project_id: project.id,
+      prompt: "Wait for one user answer, then lose the App Server.",
+    });
+    const waiting = await waitForPendingInput(
+      harness.runtime,
+      allocation.task_id,
+    );
+    expect(waiting.state).toBe("waiting_for_input");
+    expect(waiting.pending_input).not.toBeNull();
+    const appServer = harness.children.at(-1);
+    if (!appServer || appServer.exitCode !== null) {
+      throw new Error("expected an active fake App Server process");
+    }
+    const closed = new Promise<void>((resolve) =>
+      appServer.once("close", () => resolve()),
+    );
+    expect(appServer.kill()).toBe(true);
+    await expect(
+      Promise.race([
+        closed.then(() => true),
+        new Promise<boolean>((resolve) =>
+          setTimeout(() => resolve(false), 2_000),
+        ),
+      ]),
+    ).resolves.toBe(true);
+
+    const recovered = await waitForTerminal(
+      harness.runtime,
+      allocation.task_id,
+    );
+    expect(recovered.state).toBe("interrupted");
+    expect(recovered.pending_input).toBeNull();
+    expect(JSON.stringify(recovered)).not.toContain(
+      "ephemeral-private-server-request-id",
+    );
+    expect(await readFile(harness.tracePath, "utf8")).not.toContain(
+      '"kind":"user-input-response"',
+    );
+    await waitForExecutionIdle(harness.service);
+    await expectWriterReleased(harness, project);
   });
 
   it("fails the session closed when a server request cannot be correlated", async () => {

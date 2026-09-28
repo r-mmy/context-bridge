@@ -1,4 +1,5 @@
 import type {
+  AgentUserInputAnswer,
   AgentBackendInfo,
   AgentExecutionAdapter,
   AgentExecutionEvent,
@@ -14,9 +15,76 @@ import { CodexAppServer, type AppServerOptions } from "./app-server.js";
 const MAX_MODEL_PAGES = 16;
 const MAX_MODELS = 512;
 const THREAD_CLOSED_WAIT_MS = 2_000;
+const REQUEST_USER_INPUT = "item/tool/requestUserInput";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function boundedText(value: unknown, maxLength: number): value is string {
+  if (typeof value !== "string" || value.length > maxLength) return false;
+  for (let index = 0; index < value.length; index += 1) {
+    const unit = value.charCodeAt(index);
+    if (unit >= 0xd800 && unit <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return false;
+      index += 1;
+    } else if (unit >= 0xdc00 && unit <= 0xdfff) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function parseUserInputQuestions(value: unknown) {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 10) {
+    return undefined;
+  }
+  const ids = new Set<string>();
+  const questions = [];
+  for (const candidate of value) {
+    if (
+      !isRecord(candidate) ||
+      !boundedText(candidate.id, 256) ||
+      candidate.id.length === 0 ||
+      !boundedText(candidate.header, 256) ||
+      !boundedText(candidate.question, 4096) ||
+      (candidate.isOther !== undefined &&
+        typeof candidate.isOther !== "boolean") ||
+      (candidate.isSecret !== undefined &&
+        typeof candidate.isSecret !== "boolean")
+    ) {
+      return undefined;
+    }
+    if (ids.has(candidate.id)) return undefined;
+    ids.add(candidate.id);
+    let options: Array<{ label: string; description: string }> = [];
+    if (candidate.options !== undefined && candidate.options !== null) {
+      if (!Array.isArray(candidate.options) || candidate.options.length > 20) {
+        return undefined;
+      }
+      options = [];
+      for (const option of candidate.options) {
+        if (
+          !isRecord(option) ||
+          !boundedText(option.label, 512) ||
+          !boundedText(option.description, 2048)
+        ) {
+          return undefined;
+        }
+        options.push({ label: option.label, description: option.description });
+      }
+    }
+    questions.push({
+      id: candidate.id,
+      header: candidate.header,
+      question: candidate.question,
+      options,
+      isOther: candidate.isOther ?? false,
+      isSecret: candidate.isSecret ?? false,
+    });
+  }
+  return questions;
 }
 
 function parseEfforts(value: unknown): string[] {
@@ -165,13 +233,42 @@ export class CodexAgentAdapter implements AgentExecutionAdapter {
         return;
       }
       if (event.type === "server_request") {
-        const params = isRecord(event.value.params)
-          ? event.value.params
-          : undefined;
+        const params = isRecord(event.params) ? event.params : undefined;
         const threadId = boundedIdentifier(params?.threadId);
         const turnId = boundedIdentifier(params?.turnId);
+        const containsSecret =
+          event.method === REQUEST_USER_INPUT &&
+          Array.isArray(params?.questions) &&
+          params.questions.some(
+            (question) => isRecord(question) && question.isSecret === true,
+          );
+        if (
+          event.method === REQUEST_USER_INPUT &&
+          params &&
+          threadId &&
+          turnId &&
+          typeof params.isBlocking === "boolean" &&
+          boundedText(params.itemId, 256) &&
+          params.itemId.length > 0
+        ) {
+          const questions = parseUserInputQuestions(params.questions);
+          if (questions) {
+            listener({
+              type: "user_input_requested",
+              correlationId: event.correlationId,
+              threadId,
+              turnId,
+              itemId: params.itemId as string,
+              isBlocking: params.isBlocking,
+              questions,
+            });
+            return;
+          }
+        }
         listener({
           type: "unsupported_request",
+          correlationId: event.correlationId,
+          ...(containsSecret ? { containsSecret: true } : {}),
           ...(threadId ? { threadId } : {}),
           ...(turnId ? { turnId } : {}),
         });
@@ -423,6 +520,20 @@ export class CodexAgentAdapter implements AgentExecutionAdapter {
     ) {
       throw new AgentAdapterError("app_server_incompatible");
     }
+  }
+
+  async answerUserInput(input: {
+    correlationId: string;
+    answers: AgentUserInputAnswer[];
+  }): Promise<void> {
+    await this.appServer.answerUserInput({
+      correlationId: input.correlationId,
+      answers: input.answers,
+    });
+  }
+
+  async rejectServerRequest(input: { correlationId: string }): Promise<void> {
+    await this.appServer.rejectServerRequest(input);
   }
 
   async setThreadName(input: {

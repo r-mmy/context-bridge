@@ -84,6 +84,50 @@ export const TasksListInputSchema = z
 
 export const TaskCancelInputSchema = z.object({ task_id: TASK_ID }).strict();
 
+const ANSWER_TEXT = z
+  .string()
+  .min(1)
+  .refine(isWellFormedUnicode)
+  .refine((value) => Buffer.byteLength(value, "utf8") <= 4096);
+
+export const TaskAnswerInputSchema = z
+  .object({
+    task_id: TASK_ID,
+    pending_input_id: TASK_ID,
+    answers: z
+      .array(
+        z
+          .object({
+            question_id: z.string().min(1).max(256).refine(isWellFormedUnicode),
+            answers: z.array(ANSWER_TEXT).min(1).max(2),
+          })
+          .strict(),
+      )
+      .min(1)
+      .max(10),
+  })
+  .strict()
+  .superRefine((input, context) => {
+    if (
+      new Set(input.answers.map((entry) => entry.question_id)).size !==
+      input.answers.length
+    ) {
+      context.addIssue({ code: "custom", message: "duplicate question id" });
+    }
+    const totalBytes = input.answers.reduce(
+      (total, entry) =>
+        total +
+        entry.answers.reduce(
+          (sum, answer) => sum + Buffer.byteLength(answer, "utf8"),
+          0,
+        ),
+      0,
+    );
+    if (totalBytes > 32 * 1024) {
+      context.addIssue({ code: "custom", message: "answer request too large" });
+    }
+  });
+
 const TASK_STATES = [
   "queued",
   "running",
@@ -173,7 +217,37 @@ const EVENT_OUTPUT = z
     duration_ms: z.number().int().nonnegative().nullable(),
   })
   .strict();
-const PENDING_INPUT_OUTPUT = z.null();
+const PENDING_INPUT_OUTPUT = z
+  .object({
+    pending_input_id: TASK_ID,
+    turn_number: z.number().int().min(1),
+    received_at: ISO_TIME,
+    questions: z
+      .array(
+        z
+          .object({
+            question_id: z.string().min(1).max(256),
+            header: z.string().max(256),
+            question: z.string().max(4096),
+            options: z
+              .array(
+                z
+                  .object({
+                    label: z.string().max(512),
+                    description: z.string().max(2048),
+                  })
+                  .strict(),
+              )
+              .max(20),
+            is_other: z.boolean(),
+          })
+          .strict(),
+      )
+      .min(1)
+      .max(10),
+  })
+  .strict()
+  .nullable();
 const TASK_ERROR_OUTPUT = z
   .object({
     code: z.string().min(1).max(64),
@@ -250,6 +324,15 @@ export const TaskCancelOutputSchema = z
   .object({ task_id: TASK_ID, state: TASK_STATE })
   .strict();
 
+export const TaskAnswerOutputSchema = z
+  .object({
+    task_id: TASK_ID,
+    pending_input_id: TASK_ID,
+    turn_number: z.number().int().min(1),
+    state: TASK_STATE,
+  })
+  .strict();
+
 const SAFE_ERRORS = {
   agent_runtime_busy: {
     code: "agent_runtime_busy",
@@ -294,6 +377,26 @@ const SAFE_ERRORS = {
   task_state_conflict: {
     code: "task_state_conflict",
     message: "The requested task state transition is not valid.",
+    retryable: false,
+  },
+  pending_input_not_found: {
+    code: "pending_input_not_found",
+    message: "The task has no pending user input to answer.",
+    retryable: false,
+  },
+  pending_input_stale: {
+    code: "pending_input_stale",
+    message: "The pending user input is no longer current.",
+    retryable: false,
+  },
+  invalid_answers: {
+    code: "invalid_answers",
+    message: "Answers do not match the pending questions.",
+    retryable: false,
+  },
+  secret_input_requires_local_action: {
+    code: "secret_input_requires_local_action",
+    message: "The task requires a local action before it can continue.",
     retryable: false,
   },
   request_id_conflict: {
@@ -595,7 +698,7 @@ function mapTaskGet(
     next_after_seq: hasMore ? (events.at(-1)?.seq ?? null) : null,
     has_more: hasMore,
     events_truncated_before_seq: truncatedBefore,
-    pending_input: null,
+    pending_input: record.pending_input,
     local_action_required: record.local_action_required,
     final_response: finalResponse,
     final_response_included: input.include_final_response,
@@ -644,6 +747,11 @@ const START_TASK = {
 const CANCEL_TASK = {
   readOnlyHint: false,
   destructiveHint: false,
+  openWorldHint: false,
+} as const;
+const ANSWER_TASK = {
+  readOnlyHint: false,
+  destructiveHint: true,
   openWorldHint: false,
 } as const;
 
@@ -784,6 +892,19 @@ export function registerTaskTools(server: McpServer, host: TaskToolHost): void {
         const record = await host.cancelTask(task_id);
         return { task_id: record.task_id, state: record.state };
       }),
+  );
+
+  server.registerTool(
+    "task_answer",
+    {
+      description:
+        "Submit the user's answer to the current pending Codex question. This resumes the same active turn and can unblock workspace writes; use only an answer the user explicitly supplied.",
+      inputSchema: TaskAnswerInputSchema,
+      outputSchema: TaskAnswerOutputSchema,
+      annotations: ANSWER_TASK,
+    },
+    async (input) =>
+      runTaskTool(TaskAnswerOutputSchema, () => host.answerTask(input)),
   );
 }
 

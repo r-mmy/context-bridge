@@ -1,6 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
-import type { AgentExecutionAdapter, AgentExecutionEvent } from "./adapter.js";
+import type {
+  AgentExecutionAdapter,
+  AgentExecutionEvent,
+  AgentUserInputAnswer,
+} from "./adapter.js";
 import type { AgentProfile } from "./profiles.js";
 import {
   acquireConfigMutationLock,
@@ -21,6 +25,7 @@ import type {
 } from "../tasks/manager.js";
 import type { TaskRuntime } from "../tasks/runtime.js";
 import type { GitBaseline, TaskRecord, TaskState } from "../tasks/types.js";
+import type { PendingInput } from "../tasks/types.js";
 
 export const MAX_ACTIVE_AGENT_TURNS = 4;
 const INTERRUPT_TIMEOUT_MS = 15_000;
@@ -115,12 +120,99 @@ interface ActiveExecution {
   cancelRequested: boolean;
   forceFailed: boolean;
   pendingUnsupportedTurnId?: string;
+  pendingInput?: {
+    pendingInputId: string;
+    correlationId: string;
+    turnNumber: number;
+    receivedAt: string;
+  };
+  pendingInputQueued: boolean;
+  secretInputRequired: boolean;
   interrupting?: Promise<void>;
   interruptTimer?: NodeJS.Timeout;
   settling: boolean;
   eventChain: Promise<void>;
   finished: Promise<void>;
   finish: () => void;
+}
+
+export interface AnswerExecutionInput {
+  task_id: string;
+  pending_input_id: string;
+  answers: Array<{ question_id: string; answers: string[] }>;
+}
+
+export interface AnswerExecutionResult {
+  task_id: string;
+  pending_input_id: string;
+  turn_number: number;
+  state: TaskState;
+}
+
+function validAnswerText(value: string): boolean {
+  if (value.length === 0 || Buffer.byteLength(value, "utf8") > 4096) {
+    return false;
+  }
+  for (let index = 0; index < value.length; index += 1) {
+    const unit = value.charCodeAt(index);
+    if (unit >= 0xd800 && unit <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return false;
+      index += 1;
+    } else if (unit >= 0xdc00 && unit <= 0xdfff) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function normalizeAnswers(
+  pending: PendingInput,
+  supplied: AnswerExecutionInput["answers"],
+): AgentUserInputAnswer[] {
+  const byQuestion = new Map(
+    supplied.map((entry) => [entry.question_id, entry.answers]),
+  );
+  if (
+    byQuestion.size !== supplied.length ||
+    byQuestion.size !== pending.questions.length ||
+    supplied.some(
+      (entry) =>
+        !pending.questions.some((q) => q.question_id === entry.question_id),
+    )
+  ) {
+    throw new TaskError("invalid_answers");
+  }
+  let totalBytes = 0;
+  const normalized: AgentUserInputAnswer[] = [];
+  for (const question of pending.questions) {
+    const answers = byQuestion.get(question.question_id);
+    if (!answers || answers.length < 1 || answers.length > 2) {
+      throw new TaskError("invalid_answers");
+    }
+    for (const answer of answers) {
+      if (!validAnswerText(answer)) throw new TaskError("invalid_answers");
+      totalBytes += Buffer.byteLength(answer, "utf8");
+    }
+    if (answers.length === 1) {
+      const answer = answers[0]!;
+      if (
+        question.options.length > 0 &&
+        !question.options.some((option) => option.label === answer) &&
+        !question.is_other
+      ) {
+        throw new TaskError("invalid_answers");
+      }
+    } else if (
+      !question.is_other ||
+      !question.options.some((option) => option.label === answers[0])
+    ) {
+      throw new TaskError("invalid_answers");
+    }
+    normalized.push({ questionId: question.question_id, answers });
+  }
+  if (totalBytes > 32 * 1024) throw new TaskError("invalid_answers");
+  return normalized;
 }
 
 function executionError(code: string, message: string): ContextBridgeError {
@@ -382,16 +474,100 @@ export class AgentExecutionService {
       await active.finished;
       return this.runtime.manager.getTask(normalizedTaskId);
     }
-    if (!active.cancelRequested) {
-      active.cancelRequested = true;
-      active.interruptTimer = setTimeout(() => {
-        void this.handleSessionFailure();
-      }, INTERRUPT_TIMEOUT_MS);
-      await this.requestInterrupt(active);
-    }
+    const shouldInterrupt = await this.serializeActive(active, async () => {
+      if (
+        this.active.get(normalizedTaskId) !== active ||
+        active.observedTerminal !== undefined ||
+        active.settling
+      ) {
+        return false;
+      }
+      if (!active.cancelRequested) {
+        active.cancelRequested = true;
+        active.interruptTimer = setTimeout(() => {
+          void this.handleSessionFailure();
+        }, INTERRUPT_TIMEOUT_MS);
+        await this.invalidatePendingInput(active);
+      }
+      return true;
+    });
+    if (shouldInterrupt) await this.requestInterrupt(active);
     if (active.interrupting) await active.interrupting;
     await active.finished;
     return this.runtime.manager.getTask(normalizedTaskId);
+  }
+
+  async answerUserInput(
+    input: AnswerExecutionInput,
+  ): Promise<AnswerExecutionResult> {
+    const taskId = input.task_id.toLowerCase();
+    const pendingInputId = input.pending_input_id.toLowerCase();
+    const active = this.active.get(taskId);
+    if (!active) {
+      const record =
+        await this.runtime.manager.getTaskRecordForCurrentRegistration(taskId);
+      if (record.local_action_required) {
+        throw new TaskError("secret_input_requires_local_action");
+      }
+      throw new TaskError("pending_input_not_found");
+    }
+    return this.serializeActive(active, async () => {
+      if (
+        this.active.get(taskId) !== active ||
+        active.observedTerminal !== undefined ||
+        active.settling
+      ) {
+        throw new TaskError("pending_input_stale");
+      }
+      const record =
+        await this.runtime.manager.getTaskRecordForCurrentRegistration(taskId);
+      if (record.local_action_required) {
+        throw new TaskError("secret_input_requires_local_action");
+      }
+      if (!record.pending_input || record.state !== "waiting_for_input") {
+        throw new TaskError("pending_input_not_found");
+      }
+      if (
+        record.pending_input.pending_input_id !== pendingInputId ||
+        record.pending_input.turn_number !== active.allocation.turn_number
+      ) {
+        throw new TaskError("pending_input_stale");
+      }
+      const correlation = active.pendingInput;
+      if (
+        !correlation ||
+        correlation.pendingInputId !== pendingInputId ||
+        correlation.turnNumber !== record.pending_input.turn_number
+      ) {
+        throw new TaskError("pending_input_stale");
+      }
+      const answers = normalizeAnswers(record.pending_input, input.answers);
+
+      // Consume the process-local correlation before writing. Any uncertain
+      // transport failure is terminal for this request and cannot be retried.
+      delete active.pendingInput;
+      try {
+        await this.adapter.answerUserInput({
+          correlationId: correlation.correlationId,
+          answers,
+        });
+      } catch {
+        active.forceFailed = true;
+        void this.requestInterrupt(active);
+        throw new AgentAdapterError("app_server_exited");
+      }
+      const resumed = await this.runtime.manager.resolvePendingInput(
+        taskId,
+        correlation.turnNumber,
+        pendingInputId,
+      );
+      return {
+        task_id: taskId,
+        pending_input_id: pendingInputId,
+        turn_number: correlation.turnNumber,
+        state: resumed.state,
+      };
+    });
   }
 
   async close(): Promise<void> {
@@ -741,6 +917,8 @@ export class AgentExecutionService {
       earlyEvents: [],
       cancelRequested: false,
       forceFailed: false,
+      pendingInputQueued: false,
+      secretInputRequired: false,
       settling: false,
       eventChain: Promise.resolve(),
       finished,
@@ -950,16 +1128,73 @@ export class AgentExecutionService {
         ? this.byThread.get(event.threadId)
         : undefined;
       if (!active || !event.turnId) {
-        void this.handleSessionFailure();
+        if (event.containsSecret) {
+          const activeByTurn =
+            active ??
+            (event.turnId
+              ? [...this.active.values()].find(
+                  (candidate) => candidate.turnId === event.turnId,
+                )
+              : undefined);
+          if (activeByTurn) {
+            activeByTurn.secretInputRequired = true;
+            activeByTurn.forceFailed = true;
+          }
+        }
+        void this.adapter
+          .rejectServerRequest({ correlationId: event.correlationId })
+          .catch(() => undefined)
+          .then(() => this.handleSessionFailure());
         return;
       }
       if (active.turnId && active.turnId !== event.turnId) {
-        void this.handleSessionFailure();
+        if (event.containsSecret) {
+          active.secretInputRequired = true;
+          active.forceFailed = true;
+        }
+        void this.adapter
+          .rejectServerRequest({ correlationId: event.correlationId })
+          .catch(() => undefined)
+          .then(() => this.handleSessionFailure());
         return;
       }
       active.forceFailed = true;
+      if (event.containsSecret) active.secretInputRequired = true;
       active.pendingUnsupportedTurnId = event.turnId;
-      if (active.turnId) void this.requestInterrupt(active);
+      void this.serializeActive(active, async () => {
+        await this.adapter.rejectServerRequest({
+          correlationId: event.correlationId,
+        });
+        if (active.turnId) void this.requestInterrupt(active);
+      }).catch(() => this.handleSessionFailure());
+      return;
+    }
+    if (event.type === "user_input_requested") {
+      const active = this.byThread.get(event.threadId);
+      if (!active || (active.turnId && active.turnId !== event.turnId)) {
+        void this.adapter
+          .rejectServerRequest({ correlationId: event.correlationId })
+          .catch(() => undefined)
+          .then(() => this.handleSessionFailure());
+        return;
+      }
+      const duplicate =
+        active.pendingInputQueued || active.pendingInput !== undefined;
+      active.pendingInputQueued = true;
+      if (duplicate) active.forceFailed = true;
+      const queued = duplicate ? { ...event, duplicate: true } : event;
+      if (!active.turnId) {
+        active.earlyEvents.push(queued);
+        return;
+      }
+      if (active.turnId !== event.turnId) {
+        void this.adapter
+          .rejectServerRequest({ correlationId: event.correlationId })
+          .catch(() => undefined)
+          .then(() => this.handleSessionFailure());
+        return;
+      }
+      this.enqueueEvent(active, queued);
       return;
     }
     const active = this.byThread.get(event.threadId);
@@ -1005,6 +1240,10 @@ export class AgentExecutionService {
           active.finalText = event.text;
           return;
         }
+        if (event.type === "user_input_requested") {
+          await this.handleUserInputRequest(active, event);
+          return;
+        }
         if (event.type === "turn_completed") {
           if (event.status === "completed" && !active.forceFailed) {
             if (active.finalText !== undefined) {
@@ -1028,6 +1267,96 @@ export class AgentExecutionService {
         }
       })
       .catch(() => this.poisonAndStop());
+  }
+
+  private async handleUserInputRequest(
+    active: ActiveExecution,
+    event: Extract<AgentExecutionEvent, { type: "user_input_requested" }>,
+  ): Promise<void> {
+    if (
+      event.duplicate ||
+      active.forceFailed ||
+      active.cancelRequested ||
+      event.isBlocking !== true ||
+      event.questions.some((question) => question.isSecret)
+    ) {
+      if (event.questions.some((question) => question.isSecret)) {
+        active.secretInputRequired = true;
+      }
+      active.forceFailed = true;
+      active.pendingInputQueued = false;
+      await this.adapter.rejectServerRequest({
+        correlationId: event.correlationId,
+      });
+      if (active.turnId) void this.requestInterrupt(active);
+      return;
+    }
+
+    const receivedAt = new Date().toISOString();
+    const pendingInputId = randomUUID();
+    const questions = event.questions.map((question) => ({
+      question_id: question.id,
+      header: question.header,
+      question: question.question,
+      options: question.options.map((option) => ({
+        label: option.label,
+        description: option.description,
+      })),
+      is_other: question.isOther,
+    }));
+    await this.runtime.manager.beginPendingInput(
+      active.allocation.task_id,
+      active.allocation.turn_number,
+      {
+        pending_input_id: pendingInputId,
+        turn_number: active.allocation.turn_number,
+        received_at: receivedAt,
+        questions,
+      },
+    );
+    active.pendingInput = {
+      pendingInputId,
+      correlationId: event.correlationId,
+      turnNumber: active.allocation.turn_number,
+      receivedAt,
+    };
+    active.pendingInputQueued = false;
+  }
+
+  private async invalidatePendingInput(active: ActiveExecution): Promise<void> {
+    const pending = active.pendingInput;
+    delete active.pendingInput;
+    active.pendingInputQueued = false;
+    if (!pending) return;
+    await this.adapter
+      .rejectServerRequest({ correlationId: pending.correlationId })
+      .catch(() => undefined);
+  }
+
+  private serializeActive<T>(
+    active: ActiveExecution,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const pending = active.eventChain.then(operation);
+    active.eventChain = pending.then(
+      () => undefined,
+      (error: unknown) => {
+        if (
+          isTaskError(error) &&
+          [
+            "pending_input_not_found",
+            "pending_input_stale",
+            "invalid_answers",
+            "secret_input_requires_local_action",
+            "task_state_conflict",
+          ].includes(error.code)
+        ) {
+          return;
+        }
+        return this.poisonAndStop();
+      },
+    );
+    return pending;
   }
 
   private async requestInterrupt(active: ActiveExecution): Promise<void> {
@@ -1054,15 +1383,23 @@ export class AgentExecutionService {
       return;
     active.settling = true;
     try {
+      await this.invalidatePendingInput(active);
       const record = await this.runtime.manager.getTask(
         active.allocation.task_id,
       );
       if (!isTerminal(record.state)) {
-        await this.runtime.manager.transitionTurn(
-          active.allocation.task_id,
-          active.allocation.turn_number,
-          state,
-        );
+        if (active.secretInputRequired) {
+          await this.runtime.manager.requireLocalAction(
+            active.allocation.task_id,
+            active.allocation.turn_number,
+          );
+        } else {
+          await this.runtime.manager.transitionTurn(
+            active.allocation.task_id,
+            active.allocation.turn_number,
+            state,
+          );
+        }
       }
       if (releaseThread && active.threadId) {
         if (active.accepted && active.allocation.turn_number === 1) {

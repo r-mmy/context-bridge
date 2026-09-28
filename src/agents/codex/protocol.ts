@@ -30,7 +30,7 @@ export interface JsonRpcConnectionOptions {
   maxLineBytes?: number;
   maxPendingRequests?: number;
   onNotification?: (notification: JsonRpcNotification) => void;
-  onServerRequest?: (request: JsonRpcServerRequest) => void;
+  onServerRequest?: (request: JsonRpcServerRequest) => boolean;
   onFailure?: (error: AgentAdapterError) => void;
 }
 
@@ -53,7 +53,7 @@ export class JsonRpcConnection {
   private readonly maxPendingRequests: number;
   private readonly onNotification: (notification: JsonRpcNotification) => void;
   private readonly onServerRequest:
-    ((request: JsonRpcServerRequest) => void) | undefined;
+    ((request: JsonRpcServerRequest) => boolean) | undefined;
   private readonly onFailure: (error: AgentAdapterError) => void;
   private readonly fragments: Buffer[] = [];
   private fragmentBytes = 0;
@@ -118,6 +118,41 @@ export class JsonRpcConnection {
       throw new AgentAdapterError("app_server_protocol_error");
     }
     this.writeMessage({ method, ...(params ? { params } : {}) });
+  }
+
+  respondServerRequest(
+    id: RpcId,
+    response:
+      | { result: Record<string, unknown> }
+      | { error: { code: number; message: string } },
+  ): Promise<void> {
+    if (this.failure) return Promise.reject(this.failure);
+    if (!isRequestId(id)) {
+      return Promise.reject(new AgentAdapterError("app_server_protocol_error"));
+    }
+    const line = `${JSON.stringify({ id, ...response })}\n`;
+    if (Buffer.byteLength(line, "utf8") > this.maxLineBytes) {
+      const error = new AgentAdapterError("app_server_protocol_error");
+      this.fail(error);
+      return Promise.reject(error);
+    }
+    return new Promise((resolve, reject) => {
+      try {
+        this.stdin.write(line, "utf8", (error?: Error | null) => {
+          if (error) {
+            const safeError = new AgentAdapterError("app_server_exited");
+            this.fail(safeError);
+            reject(safeError);
+          } else {
+            resolve();
+          }
+        });
+      } catch {
+        const error = new AgentAdapterError("app_server_exited");
+        this.fail(error);
+        reject(error);
+      }
+    });
   }
 
   fail(error: AgentAdapterError, notify = true): void {
@@ -221,22 +256,42 @@ export class JsonRpcConnection {
           this.fail(new AgentAdapterError("app_server_protocol_error"));
           return;
         }
-        this.writeMessage({
-          id: value.id,
-          error: { code: -32601, message: "Method not supported" },
-        });
         if (!this.onServerRequest) {
-          this.fail(new AgentAdapterError("app_server_protocol_error"));
+          const rejected = this.respondServerRequest(value.id, {
+            error: { code: -32601, message: "Method not supported" },
+          });
+          void rejected
+            .finally(() => {
+              this.fail(new AgentAdapterError("app_server_protocol_error"));
+            })
+            .catch(() => undefined);
           return;
         }
         try {
-          this.onServerRequest({
+          const handled = this.onServerRequest({
             id: value.id,
             method: value.method,
             params: value.params,
           });
+          if (!handled) {
+            const rejected = this.respondServerRequest(value.id, {
+              error: { code: -32601, message: "Method not supported" },
+            });
+            void rejected
+              .finally(() => {
+                this.fail(new AgentAdapterError("app_server_protocol_error"));
+              })
+              .catch(() => undefined);
+          }
         } catch {
-          this.fail(new AgentAdapterError("app_server_protocol_error"));
+          const rejected = this.respondServerRequest(value.id, {
+            error: { code: -32601, message: "Method not supported" },
+          });
+          void rejected
+            .finally(() => {
+              this.fail(new AgentAdapterError("app_server_protocol_error"));
+            })
+            .catch(() => undefined);
         }
         return;
       }

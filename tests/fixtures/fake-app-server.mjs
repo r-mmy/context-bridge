@@ -9,6 +9,7 @@ const startupMutationRoot = process.argv[4];
 let input = "";
 const queuedRequests = [];
 let executionTurnStartCount = 0;
+const pendingUserInputResponses = new Map();
 
 if (mode === "version") {
   process.stdout.write(`codex-cli ${process.argv[5] ?? "0.157.1"}\n`, () =>
@@ -89,6 +90,24 @@ function modelPage(params) {
 }
 
 function processRequest(request) {
+  if (
+    typeof request?.method !== "string" &&
+    pendingUserInputResponses.has(request?.id)
+  ) {
+    record({
+      kind: "user-input-response",
+      id: request.id,
+      ...(request.result === undefined ? {} : { result: request.result }),
+      ...(request.error === undefined ? {} : { error: request.error }),
+    });
+    const complete = pendingUserInputResponses.get(request.id);
+    pendingUserInputResponses.delete(request.id);
+    if (request.result && complete) {
+      if (mode === "execution-server-request-fast") complete();
+      else setTimeout(complete, 5);
+    }
+    return;
+  }
   if (typeof request?.method !== "string") return;
   record({
     method: request.method,
@@ -437,17 +456,6 @@ function processRequest(request) {
       }
       return;
     }
-    if (mode === "server-request" || mode === "execution-server-request") {
-      send({
-        id: "ephemeral-private-server-request-id",
-        method: "item/tool/requestUserInput",
-        params: {
-          threadId: params.threadId,
-          turnId: executionTurnId,
-          questions: [{ question: "private question text" }],
-        },
-      });
-    }
     send({
       method: "turn/started",
       params: {
@@ -513,39 +521,162 @@ function processRequest(request) {
           },
         },
       });
-      if (mode !== "server-request" && mode !== "execution-server-request") {
-        record({
-          kind: "turn-terminal-sent",
+      record({
+        kind: "turn-terminal-sent",
+        threadId: params.threadId,
+        turnId: executionTurnId,
+        at: Date.now(),
+      });
+      send({
+        method: "turn/completed",
+        params: {
+          threadId: params.threadId,
+          turn: {
+            id: executionTurnId,
+            status:
+              mode === "turn-failed" ||
+              (mode === "terminal-mapping" && executionTurnStartCount === 1)
+                ? "failed"
+                : mode === "turn-interrupted" ||
+                    (mode === "terminal-mapping" &&
+                      executionTurnStartCount === 2)
+                  ? "interrupted"
+                  : "completed",
+            items: [],
+          },
+        },
+      });
+    };
+    const sendsInput = [
+      "execution-server-request",
+      "execution-server-request-fast",
+      "execution-server-request-single",
+      "execution-secret-request",
+      "execution-nonblocking-request",
+      "execution-second-request",
+      "execution-duplicate-question",
+      "execution-malformed-secret",
+      "execution-too-many-questions",
+    ].includes(mode);
+    const sendUserInput = (id, questions, isBlocking = true) => {
+      pendingUserInputResponses.set(id, complete);
+      send({
+        id,
+        method: "item/tool/requestUserInput",
+        params: {
           threadId: params.threadId,
           turnId: executionTurnId,
-          at: Date.now(),
-        });
-        send({
-          method: "turn/completed",
-          params: {
-            threadId: params.threadId,
-            turn: {
-              id: executionTurnId,
-              status:
-                mode === "turn-failed" ||
-                (mode === "terminal-mapping" && executionTurnStartCount === 1)
-                  ? "failed"
-                  : mode === "turn-interrupted" ||
-                      (mode === "terminal-mapping" &&
-                        executionTurnStartCount === 2)
-                    ? "interrupted"
-                    : "completed",
-              items: [],
-            },
-          },
-        });
-      }
+          itemId: "private-user-input-item",
+          isBlocking,
+          autoResolutionMs: null,
+          questions,
+        },
+      });
     };
+    if (sendsInput) {
+      const validQuestions = [
+        {
+          id: "choice",
+          header: "Choice",
+          question: "Choose a next step.",
+          isOther: false,
+          options: [
+            { label: "Proceed", description: "Continue the same turn." },
+            { label: "Wait", description: "Keep waiting." },
+          ],
+        },
+        {
+          id: "note",
+          header: "Note",
+          question: "Add a short note.",
+          options: null,
+        },
+        {
+          id: "choice-with-note",
+          header: "Choice with note",
+          question: "Choose an option and optionally add context.",
+          isOther: true,
+          options: [
+            { label: "Proceed", description: "Continue the same turn." },
+            { label: "Wait", description: "Keep waiting." },
+          ],
+        },
+        {
+          id: "__proto__",
+          header: "Opaque identifier",
+          question: "Preserve this question identifier exactly.",
+          options: null,
+        },
+      ];
+      const questions =
+        mode === "execution-server-request-single"
+          ? [validQuestions[0]]
+          : mode === "execution-secret-request"
+            ? [
+                {
+                  id: "secret-question",
+                  header: "Private secret header",
+                  question: "PRIVATE secret question",
+                  isSecret: true,
+                  options: [
+                    {
+                      label: "PRIVATE secret option",
+                      description: "PRIVATE secret description",
+                    },
+                  ],
+                },
+              ]
+            : mode === "execution-malformed-secret"
+              ? [
+                  {
+                    id: "secret-question",
+                    header: "Private secret header",
+                    question: "PRIVATE malformed secret question",
+                    isSecret: true,
+                    options: [{ label: "PRIVATE secret option" }],
+                  },
+                ]
+              : mode === "execution-duplicate-question"
+                ? [validQuestions[0], { ...validQuestions[1], id: "choice" }]
+                : mode === "execution-too-many-questions"
+                  ? Array.from({ length: 11 }, (_, index) => ({
+                      id: `question-${index}`,
+                      header: "Question",
+                      question: "Question?",
+                      options: [],
+                    }))
+                  : validQuestions;
+      sendUserInput(
+        "ephemeral-private-server-request-id",
+        questions,
+        mode !== "execution-nonblocking-request",
+      );
+      if (mode === "execution-second-request") {
+        sendUserInput("ephemeral-private-server-request-id-2", [
+          { id: "second", header: "Second", question: "Second request?" },
+        ]);
+      }
+    } else if (mode === "execution-unsupported-request") {
+      send({
+        id: "ephemeral-private-server-request-id",
+        method: "item/tool/call",
+        params: { threadId: params.threadId, turnId: executionTurnId },
+      });
+    }
     if (
       mode === "delayed-turn" ||
       mode === "delayed-interrupt" ||
       mode === "interrupt-failure" ||
-      mode === "execution-uncorrelated-after-two"
+      mode === "execution-uncorrelated-after-two" ||
+      mode === "execution-server-request" ||
+      mode === "execution-server-request-fast" ||
+      mode === "execution-server-request-single" ||
+      mode === "execution-secret-request" ||
+      mode === "execution-nonblocking-request" ||
+      mode === "execution-second-request" ||
+      mode === "execution-duplicate-question" ||
+      mode === "execution-malformed-secret" ||
+      mode === "execution-too-many-questions"
     ) {
       return;
     }

@@ -9,6 +9,10 @@ export type TaskErrorCode =
   | "task_invalid_input"
   | "task_id_conflict"
   | "task_state_conflict"
+  | "pending_input_not_found"
+  | "pending_input_stale"
+  | "invalid_answers"
+  | "secret_input_requires_local_action"
   | "request_id_conflict"
   | "task_wait_aborted"
   | "task_runtime_closed"
@@ -24,6 +28,11 @@ const SAFE_MESSAGES: Record<TaskErrorCode, string> = {
   task_invalid_input: "Task input is invalid.",
   task_id_conflict: "A task with this identifier already exists.",
   task_state_conflict: "The requested task state transition is not valid.",
+  pending_input_not_found: "The task has no pending user input to answer.",
+  pending_input_stale: "The pending user input is no longer current.",
+  invalid_answers: "Answers do not match the pending questions.",
+  secret_input_requires_local_action:
+    "The task requires a local action before it can continue.",
   request_id_conflict:
     "This request identifier was already used for a different operation.",
   task_wait_aborted: "Waiting for task changes was aborted.",

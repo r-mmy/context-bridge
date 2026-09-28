@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import {
   mkdir,
@@ -248,7 +249,20 @@ describe.sequential("task runtime ownership and recovery", () => {
     );
     const waiting = await makeTask("waiting");
     await manager.transitionTurn(waiting.task_id, 1, "running");
-    await manager.transitionTurn(waiting.task_id, 1, "waiting_for_input");
+    await manager.beginPendingInput(waiting.task_id, 1, {
+      pending_input_id: randomUUID(),
+      turn_number: 1,
+      received_at: new Date().toISOString(),
+      questions: [
+        {
+          question_id: "choice",
+          header: "Choice",
+          question: "Choose one.",
+          options: [],
+          is_other: false,
+        },
+      ],
+    });
 
     const terminal: Array<{
       taskId: string;
@@ -267,16 +281,8 @@ describe.sequential("task runtime ownership and recovery", () => {
       terminal.push({ taskId: allocation.task_id, state });
     }
     const localOnly = await makeTask("secret-local-action");
-    await manager.transitionTurn(localOnly.task_id, 1, "interrupted");
-    const localOnlyRecord = await manager.getTask(localOnly.task_id);
-    localOnlyRecord.local_action_required = true;
-    localOnlyRecord.safe_error = {
-      code: "secret_input_requires_local_action",
-    };
-    localOnlyRecord.turns[0]!.safe_error = {
-      code: "secret_input_requires_local_action",
-    };
-    await harness.store.replace(localOnlyRecord);
+    await manager.transitionTurn(localOnly.task_id, 1, "running");
+    await manager.requireLocalAction(localOnly.task_id, 1);
     terminal.push({
       taskId: localOnly.task_id,
       state: "interrupted",

@@ -22,6 +22,20 @@ export interface AgentExecutionTurn {
   status: "completed" | "interrupted" | "failed" | "inProgress";
 }
 
+export interface AgentUserInputQuestion {
+  id: string;
+  header: string;
+  question: string;
+  options: Array<{ label: string; description: string }>;
+  isOther: boolean;
+  isSecret: boolean;
+}
+
+export interface AgentUserInputAnswer {
+  questionId: string;
+  answers: string[];
+}
+
 export type AgentExecutionEvent =
   | { type: "turn_started"; threadId: string; turnId: string }
   | {
@@ -38,8 +52,20 @@ export type AgentExecutionEvent =
     }
   | {
       type: "unsupported_request";
+      correlationId: string;
+      containsSecret?: boolean;
       threadId?: string;
       turnId?: string;
+    }
+  | {
+      type: "user_input_requested";
+      correlationId: string;
+      threadId: string;
+      turnId: string;
+      itemId: string;
+      isBlocking: boolean;
+      questions: AgentUserInputQuestion[];
+      duplicate?: boolean;
     }
   | { type: "session_failed" };
 
@@ -63,6 +89,11 @@ export interface AgentExecutionAdapter extends AgentAdapter {
     mode: "default" | "plan";
   }): Promise<AgentExecutionTurn>;
   interruptTurn(input: { threadId: string; turnId: string }): Promise<void>;
+  answerUserInput(input: {
+    correlationId: string;
+    answers: AgentUserInputAnswer[];
+  }): Promise<void>;
+  rejectServerRequest(input: { correlationId: string }): Promise<void>;
   setThreadName(input: { threadId: string; name: string }): Promise<void>;
   releaseThread(input: {
     threadId: string;

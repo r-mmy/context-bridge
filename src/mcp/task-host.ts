@@ -20,6 +20,13 @@ export interface TaskContinuationResult {
   allocation: TaskAllocation;
 }
 
+export interface TaskAnswerResult {
+  task_id: string;
+  pending_input_id: string;
+  turn_number: number;
+  state: TaskRecord["state"];
+}
+
 /** Internal operations required by the public task MCP façade. */
 export interface TaskToolHost {
   startTask(input: StartExecutionInput): Promise<TaskRecord>;
@@ -36,6 +43,11 @@ export interface TaskToolHost {
     limit: number;
   }): Promise<TaskRecordPage>;
   cancelTask(taskId: string): Promise<TaskRecord>;
+  answerTask(input: {
+    task_id: string;
+    pending_input_id: string;
+    answers: Array<{ question_id: string; answers: string[] }>;
+  }): Promise<TaskAnswerResult>;
   close(): Promise<void>;
 }
 
@@ -128,6 +140,19 @@ export class LazyTaskToolHost implements TaskToolHost {
       const service = await this.getExecutionService();
       await service.cancelTask(taskId);
       return this.getTask(taskId);
+    });
+  }
+
+  answerTask(input: {
+    task_id: string;
+    pending_input_id: string;
+    answers: Array<{ question_id: string; answers: string[] }>;
+  }): Promise<TaskAnswerResult> {
+    return this.trackExecutionOperation(async () => {
+      const runtime = await this.getRuntime();
+      await runtime.manager.getTaskRecordForCurrentRegistration(input.task_id);
+      const service = await this.getExecutionService();
+      return service.answerUserInput(input);
     });
   }
 

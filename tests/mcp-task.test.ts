@@ -18,6 +18,7 @@ import { createContextBridgeServer } from "../src/mcp/server.js";
 import type { TaskRecordPage, TaskToolHost } from "../src/mcp/task-host.js";
 import {
   TaskAcceptedOutputSchema,
+  TaskAnswerInputSchema,
   TaskCancelOutputSchema,
   TaskGetInputSchema,
   TaskContinueInputSchema,
@@ -25,6 +26,7 @@ import {
   TasksListInputSchema,
 } from "../src/mcp/task-tools.js";
 import type { TaskGetOutputSchema } from "../src/mcp/task-tools.js";
+import type { TaskAnswerOutputSchema } from "../src/mcp/task-tools.js";
 
 const NOW = "2026-09-26T12:00:00.000Z";
 
@@ -34,6 +36,7 @@ function makeEvent(
   kind: TaskEvent["kind"],
   status: TaskEvent["status"],
   turn_number: number | null,
+  duration_ms: number | null = null,
 ): TaskEvent {
   return {
     seq,
@@ -42,7 +45,7 @@ function makeEvent(
     category,
     kind,
     status,
-    duration_ms: null,
+    duration_ms,
   };
 }
 
@@ -137,6 +140,30 @@ function makeRecord(
   return parsed;
 }
 
+function makePendingInput() {
+  return {
+    pending_input_id: randomUUID(),
+    turn_number: 1,
+    received_at: NOW,
+    questions: [
+      {
+        question_id: "choice",
+        header: "Choice",
+        question: "Choose a safe option.",
+        options: [{ label: "Proceed", description: "Continue this turn." }],
+        is_other: false,
+      },
+      {
+        question_id: "note",
+        header: "Note",
+        question: "Add a note.",
+        options: [],
+        is_other: false,
+      },
+    ],
+  };
+}
+
 class MemoryTaskHost implements TaskToolHost {
   record = makeRecord();
   startInput: unknown = undefined;
@@ -146,6 +173,7 @@ class MemoryTaskHost implements TaskToolHost {
   continueInput: unknown = undefined;
   continueError: unknown = undefined;
   cancelCalls = 0;
+  answerCalls: Array<Parameters<TaskToolHost["answerTask"]>[0]> = [];
   cancelGate: Promise<void> | undefined;
   getError: unknown = undefined;
   waitCalls: Array<{
@@ -321,6 +349,39 @@ class MemoryTaskHost implements TaskToolHost {
     return structuredClone(this.record);
   }
 
+  async answerTask(input: Parameters<TaskToolHost["answerTask"]>[0]) {
+    this.answerCalls.push(structuredClone(input));
+    this.record = TaskRecordSchema.parse({
+      ...this.record,
+      state: "running",
+      pending_input: null,
+      turns: this.record.turns.map((turn) => ({
+        ...turn,
+        state: "running",
+        completed_at: null,
+      })),
+    });
+    const event = makeEvent(
+      this.record.event_seq + 1,
+      "input",
+      "activity",
+      "saved",
+      1,
+      37,
+    );
+    this.record = TaskRecordSchema.parse({
+      ...this.record,
+      event_seq: event.seq,
+      events: [...this.record.events, event],
+    });
+    return {
+      task_id: input.task_id,
+      pending_input_id: input.pending_input_id,
+      turn_number: this.record.turn_count,
+      state: this.record.state,
+    };
+  }
+
   async close() {}
 }
 
@@ -463,9 +524,42 @@ describe("public task MCP façade", () => {
         .success,
     ).toBe(false);
     expect(TasksListInputSchema.safeParse({ limit: 101 }).success).toBe(false);
+    const answer = {
+      task_id: randomUUID(),
+      pending_input_id: randomUUID(),
+      answers: [
+        { question_id: "choice", answers: ["Proceed"] },
+        { question_id: "note", answers: ["user supplied"] },
+      ],
+    };
+    expect(TaskAnswerInputSchema.safeParse(answer).success).toBe(true);
+    expect(
+      TaskAnswerInputSchema.safeParse({
+        ...answer,
+        answers: [
+          ...answer.answers,
+          { question_id: "choice", answers: ["duplicate"] },
+        ],
+      }).success,
+    ).toBe(false);
+    expect(
+      TaskAnswerInputSchema.safeParse({
+        ...answer,
+        answers: [{ question_id: "choice", answers: ["x".repeat(4097)] }],
+      }).success,
+    ).toBe(false);
+    expect(
+      TaskAnswerInputSchema.safeParse({
+        ...answer,
+        answers: Array.from({ length: 9 }, (_, index) => ({
+          question_id: `q${index}`,
+          answers: ["x".repeat(4096)],
+        })),
+      }).success,
+    ).toBe(false);
   });
 
-  it("registers fourteen stdio-capable tools with the exact task annotations", async () => {
+  it("registers fifteen stdio-capable tools with the exact task annotations", async () => {
     const host = new MemoryTaskHost();
     await withClient(host, async (client) => {
       const result = await client.listTools();
@@ -479,6 +573,7 @@ describe("public task MCP façade", () => {
         "git_status",
         "project_get",
         "projects_list",
+        "task_answer",
         "task_cancel",
         "task_continue",
         "task_get",
@@ -496,7 +591,11 @@ describe("public task MCP façade", () => {
         destructiveHint: true,
         openWorldHint: false,
       });
-      expect(tools.has("task_answer")).toBe(false);
+      expect(tools.get("task_answer")?.annotations).toMatchObject({
+        readOnlyHint: false,
+        destructiveHint: true,
+        openWorldHint: false,
+      });
       for (const name of ["task_get", "tasks_list"]) {
         expect(tools.get(name)?.annotations).toMatchObject({
           readOnlyHint: true,
@@ -512,6 +611,83 @@ describe("public task MCP façade", () => {
       expect(tools.get("task_cancel")?.description).toContain(
         "partial workspace edits",
       );
+    });
+  });
+
+  it("exposes normalized pending input and routes a strict task_answer request", async () => {
+    const host = new MemoryTaskHost();
+    host.record.state = "waiting_for_input";
+    host.record.turns[0]!.state = "waiting_for_input";
+    host.record.pending_input = makePendingInput();
+    host.record = TaskRecordSchema.parse(host.record);
+    const pendingInputId = host.record.pending_input!.pending_input_id;
+    await withClient(host, async (client) => {
+      const snapshot = await client.callTool({
+        name: "task_get",
+        arguments: { task_id: host.record.task_id, wait_ms: 30_000 },
+      });
+      expect(host.waitCalls).toHaveLength(0);
+      const output = structured<z.infer<typeof TaskGetOutputSchema>>(snapshot);
+      expect(output.pending_input).toMatchObject({
+        pending_input_id: pendingInputId,
+        turn_number: 1,
+        questions: [
+          { question_id: "choice", is_other: false },
+          { question_id: "note", options: [] },
+        ],
+      });
+      const pendingJson = JSON.stringify(output.pending_input);
+      for (const privateField of [
+        "threadId",
+        "turnId",
+        "itemId",
+        "requestId",
+        "isSecret",
+      ]) {
+        expect(pendingJson).not.toContain(privateField);
+      }
+
+      const answered = await client.callTool({
+        name: "task_answer",
+        arguments: {
+          task_id: host.record.task_id,
+          pending_input_id: pendingInputId,
+          answers: [
+            { question_id: "choice", answers: ["Proceed"] },
+            { question_id: "note", answers: ["user-approved"] },
+          ],
+        },
+      });
+      expect(
+        structured<z.infer<typeof TaskAnswerOutputSchema>>(answered),
+      ).toEqual({
+        task_id: host.record.task_id,
+        pending_input_id: pendingInputId,
+        turn_number: 1,
+        state: "running",
+      });
+      expect(host.answerCalls).toEqual([
+        {
+          task_id: host.record.task_id,
+          pending_input_id: pendingInputId,
+          answers: [
+            { question_id: "choice", answers: ["Proceed"] },
+            { question_id: "note", answers: ["user-approved"] },
+          ],
+        },
+      ]);
+      const afterAnswer = await client.callTool({
+        name: "task_get",
+        arguments: { task_id: host.record.task_id },
+      });
+      const resolved =
+        structured<z.infer<typeof TaskGetOutputSchema>>(afterAnswer);
+      expect(resolved.events.at(-1)).toMatchObject({
+        category: "user_input",
+        status: "resolved",
+        duration_ms: 37,
+      });
+      expect(JSON.stringify(resolved.events)).not.toContain("user-approved");
     });
   });
 

@@ -13,6 +13,7 @@ import {
   MAX_TASKS,
   MAX_TOTAL_TASK_BYTES,
   MAX_TURNS_PER_TASK,
+  PendingInputSchema,
   START_IDEMPOTENCY_SCHEMA,
   TimestampSchema,
   TaskEventSchema,
@@ -26,6 +27,7 @@ import {
   type FinalResponse,
   type GitBaseline,
   type IdempotencyRecord,
+  type PendingInput,
   type SafeTaskErrorCode,
   type TaskEvent,
   type TaskMode,
@@ -675,11 +677,23 @@ export class TaskManager {
         !turn ||
         turn.turn_number !== turnNumber ||
         turnNumber !== record.turn_count ||
+        nextState === "waiting_for_input" ||
+        (turn.state === "waiting_for_input" && nextState === "running") ||
         !this.canTransition(turn.state, nextState)
       ) {
         throw new TaskError("task_state_conflict");
       }
       const now = new Date().toISOString();
+      if (record.pending_input) {
+        const waitMs = Math.max(
+          0,
+          Date.parse(now) - Date.parse(record.pending_input.received_at),
+        );
+        if (turn.input_wait_ms + waitMs > Number.MAX_SAFE_INTEGER) {
+          throw new TaskError("task_store_capacity");
+        }
+        turn.input_wait_ms += waitMs;
+      }
       turn.state = nextState;
       if (nextState === "running" && turn.started_at === null) {
         turn.started_at = now;
@@ -700,6 +714,170 @@ export class TaskManager {
           category: "turn",
           kind: "state_changed",
           status: nextState,
+        },
+        now,
+      );
+      await this.persistReplacement(record);
+      this.signals.notify(taskId);
+      return record;
+    });
+  }
+
+  async beginPendingInput(
+    taskId: string,
+    turnNumber: number,
+    pendingInput: PendingInput,
+  ): Promise<TaskRecord> {
+    this.assertOwner();
+    taskId = normalizeTaskId(taskId);
+    const parsed = PendingInputSchema.safeParse(pendingInput);
+    if (!parsed.success || parsed.data.turn_number !== turnNumber) {
+      throw new TaskError("task_invalid_input");
+    }
+    return this.withKeyQueue(this.taskQueues, taskId, async () => {
+      const record = await this.store.read(taskId);
+      const turn = record.turns[turnNumber - 1];
+      if (
+        !turn ||
+        turnNumber !== record.turn_count ||
+        turn.state !== "running" ||
+        record.state !== "running" ||
+        record.pending_input !== null ||
+        record.local_action_required ||
+        turn.input_wait_count >= Number.MAX_SAFE_INTEGER
+      ) {
+        throw new TaskError("task_state_conflict");
+      }
+      const now = new Date().toISOString();
+      turn.state = "waiting_for_input";
+      turn.input_wait_count += 1;
+      record.state = "waiting_for_input";
+      record.pending_input = structuredClone(parsed.data);
+      record.updated_at = now;
+      appendTaskEventToRecord(
+        record,
+        {
+          turn_number: turnNumber,
+          category: "input",
+          kind: "state_changed",
+          status: "waiting_for_input",
+        },
+        now,
+      );
+      await this.persistReplacement(record);
+      this.signals.notify(taskId);
+      return record;
+    });
+  }
+
+  async resolvePendingInput(
+    taskId: string,
+    turnNumber: number,
+    pendingInputId: string,
+  ): Promise<TaskRecord> {
+    this.assertOwner();
+    taskId = normalizeTaskId(taskId);
+    if (!isTaskUuid(pendingInputId)) throw new TaskError("task_invalid_input");
+    pendingInputId = pendingInputId.toLowerCase();
+    return this.withKeyQueue(this.taskQueues, taskId, async () => {
+      const record = await this.store.read(taskId);
+      const turn = record.turns[turnNumber - 1];
+      const pending = record.pending_input;
+      if (
+        !turn ||
+        turnNumber !== record.turn_count ||
+        turn.state !== "waiting_for_input" ||
+        record.state !== "waiting_for_input" ||
+        !pending ||
+        pending.turn_number !== turnNumber ||
+        pending.pending_input_id !== pendingInputId
+      ) {
+        throw new TaskError("pending_input_stale");
+      }
+      const now = new Date().toISOString();
+      const waitMs = Math.max(
+        0,
+        Date.parse(now) - Date.parse(pending.received_at),
+      );
+      if (turn.input_wait_ms + waitMs > Number.MAX_SAFE_INTEGER) {
+        throw new TaskError("task_store_capacity");
+      }
+      turn.input_wait_ms += waitMs;
+      turn.state = "running";
+      record.state = "running";
+      record.pending_input = null;
+      record.updated_at = now;
+      appendTaskEventToRecord(
+        record,
+        {
+          turn_number: turnNumber,
+          category: "input",
+          kind: "state_changed",
+          status: "running",
+        },
+        now,
+      );
+      appendTaskEventToRecord(
+        record,
+        {
+          turn_number: turnNumber,
+          category: "input",
+          kind: "activity",
+          status: "saved",
+          duration_ms: waitMs,
+        },
+        now,
+      );
+      await this.persistReplacement(record);
+      this.signals.notify(taskId);
+      return record;
+    });
+  }
+
+  async requireLocalAction(
+    taskId: string,
+    turnNumber: number,
+  ): Promise<TaskRecord> {
+    this.assertOwner();
+    taskId = normalizeTaskId(taskId);
+    return this.withKeyQueue(this.taskQueues, taskId, async () => {
+      const record = await this.store.read(taskId);
+      const turn = record.turns[turnNumber - 1];
+      if (
+        !turn ||
+        turnNumber !== record.turn_count ||
+        !["running", "waiting_for_input"].includes(turn.state) ||
+        record.state !== turn.state
+      ) {
+        if (record.local_action_required) return record;
+        throw new TaskError("task_state_conflict");
+      }
+      const now = new Date().toISOString();
+      if (record.pending_input) {
+        const waitMs = Math.max(
+          0,
+          Date.parse(now) - Date.parse(record.pending_input.received_at),
+        );
+        if (turn.input_wait_ms + waitMs > Number.MAX_SAFE_INTEGER) {
+          throw new TaskError("task_store_capacity");
+        }
+        turn.input_wait_ms += waitMs;
+      }
+      turn.state = "interrupted";
+      turn.completed_at = now;
+      turn.safe_error = { code: "secret_input_requires_local_action" };
+      record.state = "interrupted";
+      record.pending_input = null;
+      record.local_action_required = true;
+      record.safe_error = { code: "secret_input_requires_local_action" };
+      record.updated_at = now;
+      appendTaskEventToRecord(
+        record,
+        {
+          turn_number: turnNumber,
+          category: "input",
+          kind: "state_changed",
+          status: "interrupted",
         },
         now,
       );

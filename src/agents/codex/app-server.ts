@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import {
   spawn as nodeSpawn,
   type ChildProcessWithoutNullStreams,
@@ -15,7 +16,6 @@ import {
   DEFAULT_REQUEST_TIMEOUT_MS,
   JsonRpcConnection,
   type JsonRpcNotification,
-  type JsonRpcServerRequest,
 } from "./protocol.js";
 
 const CODEX_ARGUMENTS = [
@@ -53,8 +53,19 @@ export interface AppServerOptions {
 
 type AppServerEvent =
   | { type: "notification"; value: JsonRpcNotification }
-  | { type: "server_request"; value: JsonRpcServerRequest }
+  | {
+      type: "server_request";
+      correlationId: string;
+      method: string;
+      params: unknown;
+    }
   | { type: "failure" };
+
+const SERVER_REQUEST_ERROR = {
+  code: -32000,
+  message:
+    "The request requires a local action that Context Bridge cannot perform.",
+} as const;
 
 function addIfPresent(
   output: NodeJS.ProcessEnv,
@@ -146,6 +157,7 @@ class AppServerSession {
   private stopping = false;
   private failure: AgentAdapterError | undefined;
   private backendInfo: AppServerInfo | undefined;
+  private readonly pendingServerRequests = new Map<string, number | string>();
 
   constructor(
     readonly child: ChildProcessWithoutNullStreams,
@@ -161,9 +173,17 @@ class AppServerSession {
         this.emit({ type: "notification", value });
       },
       onServerRequest: (value) => {
-        if (!this.emit({ type: "server_request", value })) {
-          this.fail(new AgentAdapterError("app_server_protocol_error"));
-        }
+        if (this.pendingServerRequests.size >= 32) return false;
+        const correlationId = randomUUID();
+        this.pendingServerRequests.set(correlationId, value.id);
+        const accepted = this.emit({
+          type: "server_request",
+          correlationId,
+          method: value.method,
+          params: value.params,
+        });
+        if (!accepted) this.pendingServerRequests.delete(correlationId);
+        return accepted;
       },
       onFailure: (error) => this.fail(error),
     });
@@ -231,8 +251,47 @@ class AppServerSession {
     return this.connection.request(method, params, this.requestTimeoutMs);
   }
 
+  async answerUserInput(
+    correlationId: string,
+    answers: Array<{ questionId: string; answers: string[] }>,
+  ): Promise<void> {
+    if (
+      answers.length < 1 ||
+      answers.length > 10 ||
+      answers.some(
+        (entry) =>
+          entry.questionId.length === 0 ||
+          entry.questionId.length > 256 ||
+          entry.answers.length < 1 ||
+          entry.answers.length > 2 ||
+          entry.answers.some(
+            (answer) =>
+              answer.length === 0 || Buffer.byteLength(answer, "utf8") > 4096,
+          ),
+      )
+    ) {
+      throw new AgentAdapterError("app_server_protocol_error");
+    }
+    const answerMap = Object.create(null) as Record<
+      string,
+      { answers: string[] }
+    >;
+    for (const entry of answers)
+      answerMap[entry.questionId] = { answers: entry.answers };
+    await this.respondServerRequest(correlationId, {
+      result: { answers: answerMap },
+    });
+  }
+
+  async rejectServerRequest(correlationId: string): Promise<void> {
+    await this.respondServerRequest(correlationId, {
+      error: SERVER_REQUEST_ERROR,
+    });
+  }
+
   async close(gracefulTimeoutMs: number): Promise<void> {
     this.stopping = true;
+    this.pendingServerRequests.clear();
     this.connection.fail(new AgentAdapterError("app_server_exited"), false);
     if (this.closedState) return;
     this.child.stdin.end();
@@ -264,6 +323,7 @@ class AppServerSession {
   private fail(error: AgentAdapterError): void {
     if (this.failure) return;
     this.failure = error;
+    this.pendingServerRequests.clear();
     this.emit({ type: "failure" });
     this.connection.fail(error, false);
     if (!this.closedState && !this.stopping) {
@@ -273,6 +333,19 @@ class AppServerSession {
         // The child may already have exited.
       }
     }
+  }
+
+  private async respondServerRequest(
+    correlationId: string,
+    response:
+      | { result: Record<string, unknown> }
+      | { error: { code: number; message: string } },
+  ): Promise<void> {
+    const id = this.pendingServerRequests.get(correlationId);
+    if (id === undefined)
+      throw new AgentAdapterError("app_server_protocol_error");
+    this.pendingServerRequests.delete(correlationId);
+    await this.connection.respondServerRequest(id, response);
   }
 }
 
@@ -404,6 +477,22 @@ export class CodexAppServer {
     return session.request("turn/interrupt", params);
   }
 
+  async answerUserInput(params: {
+    correlationId: string;
+    answers: Array<{ questionId: string; answers: string[] }>;
+  }): Promise<void> {
+    return this.requireCurrentSession().answerUserInput(
+      params.correlationId,
+      params.answers,
+    );
+  }
+
+  async rejectServerRequest(params: { correlationId: string }): Promise<void> {
+    return this.requireCurrentSession().rejectServerRequest(
+      params.correlationId,
+    );
+  }
+
   async setThreadName(params: {
     threadId: string;
     name: string;
@@ -427,6 +516,12 @@ export class CodexAppServer {
 
   private async getReadySession(): Promise<AppServerSession> {
     await this.start();
+    const session = this.session;
+    if (!session?.isUsable) throw new AgentAdapterError("app_server_exited");
+    return session;
+  }
+
+  private requireCurrentSession(): AppServerSession {
     const session = this.session;
     if (!session?.isUsable) throw new AgentAdapterError("app_server_exited");
     return session;

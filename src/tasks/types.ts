@@ -166,6 +166,43 @@ export const FinalResponseSchema = z
 
 export type FinalResponse = z.infer<typeof FinalResponseSchema>;
 
+const PendingInputOptionSchema = z
+  .object({
+    label: z.string().max(512).refine(isWellFormedUnicode),
+    description: z.string().max(2048).refine(isWellFormedUnicode),
+  })
+  .strict();
+
+const PendingInputQuestionSchema = z
+  .object({
+    question_id: z.string().min(1).max(256).refine(isWellFormedUnicode),
+    header: z.string().max(256).refine(isWellFormedUnicode),
+    question: z.string().max(4096).refine(isWellFormedUnicode),
+    options: z.array(PendingInputOptionSchema).max(20),
+    is_other: z.boolean(),
+  })
+  .strict();
+
+export const PendingInputSchema = z
+  .object({
+    pending_input_id: UuidSchema,
+    turn_number: z.number().int().min(1).max(MAX_TURNS_PER_TASK),
+    received_at: TimestampSchema,
+    questions: z.array(PendingInputQuestionSchema).min(1).max(10),
+  })
+  .strict()
+  .superRefine((pending, context) => {
+    const ids = new Set<string>();
+    for (const question of pending.questions) {
+      if (ids.has(question.question_id)) {
+        context.addIssue({ code: "custom", message: "duplicate question id" });
+      }
+      ids.add(question.question_id);
+    }
+  });
+
+export type PendingInput = z.infer<typeof PendingInputSchema>;
+
 export const TaskEventSchema = z
   .object({
     seq: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER),
@@ -265,7 +302,7 @@ const TaskRecordBaseSchema = z
       .int()
       .min(0)
       .max(Number.MAX_SAFE_INTEGER),
-    pending_input: z.null(),
+    pending_input: PendingInputSchema.nullable(),
     local_action_required: z.boolean(),
     final_response: FinalResponseSchema.nullable(),
     safe_error: SafeErrorSchema.nullable(),
@@ -305,6 +342,23 @@ export const TaskRecordSchema = TaskRecordBaseSchema.superRefine(
       context.addIssue({
         code: "custom",
         message: "secret-input error requires local action",
+      });
+    }
+    if (
+      record.state === "waiting_for_input" &&
+      (!record.pending_input ||
+        record.pending_input.turn_number !== record.turn_count ||
+        record.local_action_required)
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "waiting task requires a current pending input",
+      });
+    }
+    if (record.state !== "waiting_for_input" && record.pending_input !== null) {
+      context.addIssue({
+        code: "custom",
+        message: "pending input requires waiting state",
       });
     }
     let previousSeq = record.events_truncated_before_seq;

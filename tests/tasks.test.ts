@@ -123,6 +123,23 @@ async function createTask(
   return { allocation, record: await harness.store.read(allocation.task_id) };
 }
 
+async function waitForInput(manager: TaskRuntime["manager"], taskId: string) {
+  return manager.beginPendingInput(taskId, 1, {
+    pending_input_id: randomUUID(),
+    turn_number: 1,
+    received_at: new Date().toISOString(),
+    questions: [
+      {
+        question_id: "choice",
+        header: "Choice",
+        question: "Choose one.",
+        options: [],
+        is_other: false,
+      },
+    ],
+  });
+}
+
 afterEach(async () => {
   await Promise.all(runtimes.splice(0).map((runtime) => runtime.close()));
   await Promise.all(
@@ -274,6 +291,20 @@ describe.sequential("task persistence and manager", () => {
     const waiting = structuredClone(record);
     waiting.state = "waiting_for_input";
     waiting.turns[0]!.state = "waiting_for_input";
+    waiting.pending_input = {
+      pending_input_id: randomUUID(),
+      turn_number: 1,
+      received_at: now,
+      questions: [
+        {
+          question_id: "choice",
+          header: "Choice",
+          question: "Choose one.",
+          options: [],
+          is_other: false,
+        },
+      ],
+    };
     waiting.updated_at = now;
     appendTaskEventToRecord(
       waiting,
@@ -462,13 +493,13 @@ describe.sequential("task persistence and manager", () => {
       manager.transitionTurn(allocation.task_id, 1, "completed"),
     ).rejects.toMatchObject({ code: "task_state_conflict" });
     await manager.transitionTurn(allocation.task_id, 1, "running");
-    const waiting = await manager.transitionTurn(
+    const waiting = await waitForInput(manager, allocation.task_id);
+    expect(waiting.local_action_required).toBe(false);
+    await manager.resolvePendingInput(
       allocation.task_id,
       1,
-      "waiting_for_input",
+      waiting.pending_input!.pending_input_id,
     );
-    expect(waiting.local_action_required).toBe(false);
-    await manager.transitionTurn(allocation.task_id, 1, "running");
     const completed = await manager.transitionTurn(
       allocation.task_id,
       1,
@@ -492,7 +523,6 @@ describe.sequential("task persistence and manager", () => {
     ]);
 
     for (const [from, to] of [
-      ["queued", "waiting_for_input"],
       ["running", "queued"],
       ["waiting_for_input", "completed"],
       ["failed", "running"],
@@ -504,11 +534,7 @@ describe.sequential("task persistence and manager", () => {
         await manager.transitionTurn(invalid.allocation.task_id, 1, "running");
       }
       if (from === "waiting_for_input") {
-        await manager.transitionTurn(
-          invalid.allocation.task_id,
-          1,
-          "waiting_for_input",
-        );
+        await waitForInput(manager, invalid.allocation.task_id);
       }
       if (from === "failed" || from === "cancelled" || from === "interrupted") {
         await manager.transitionTurn(invalid.allocation.task_id, 1, from);
@@ -527,7 +553,6 @@ describe.sequential("task persistence and manager", () => {
       { from: "queued", to: "failed" },
       { from: "queued", to: "cancelled" },
       { from: "queued", to: "interrupted" },
-      { from: "running", via: "running", to: "waiting_for_input" },
       { from: "running", via: "running", to: "completed" },
       { from: "running", via: "running", to: "failed" },
       { from: "running", via: "running", to: "cancelled" },
@@ -535,7 +560,6 @@ describe.sequential("task persistence and manager", () => {
       { from: "waiting_for_input", via: "running", to: "failed" },
       { from: "waiting_for_input", via: "running", to: "cancelled" },
       { from: "waiting_for_input", via: "running", to: "interrupted" },
-      { from: "waiting_for_input", via: "running", to: "running" },
     ];
     for (const item of cases) {
       const { allocation } = await createTask(harness);
@@ -543,31 +567,40 @@ describe.sequential("task persistence and manager", () => {
         await manager.transitionTurn(allocation.task_id, 1, "running");
       }
       if (item.from === "waiting_for_input") {
-        await manager.transitionTurn(
-          allocation.task_id,
-          1,
-          "waiting_for_input",
-        );
+        await waitForInput(manager, allocation.task_id);
       }
-      if (item.from === "waiting_for_input" && item.to === "running") {
-        const resumed = await manager.transitionTurn(
-          allocation.task_id,
-          1,
-          "running",
-        );
-        expect(resumed.state).toBe("running");
-      } else {
-        const result = await manager.transitionTurn(
-          allocation.task_id,
-          1,
-          item.to,
-        );
-        expect(result.state).toBe(item.to);
-        if (item.to === "waiting_for_input" || item.to === "interrupted") {
-          expect(result.local_action_required).toBe(false);
-        }
+      const result = await manager.transitionTurn(
+        allocation.task_id,
+        1,
+        item.to,
+      );
+      expect(result.state).toBe(item.to);
+      if (item.to === "interrupted") {
+        expect(result.local_action_required).toBe(false);
       }
     }
+    const pendingTask = await createTask(harness);
+    await manager.transitionTurn(pendingTask.allocation.task_id, 1, "running");
+    const pending = await waitForInput(manager, pendingTask.allocation.task_id);
+    const resumed = await manager.resolvePendingInput(
+      pendingTask.allocation.task_id,
+      1,
+      pending.pending_input!.pending_input_id,
+    );
+    expect(resumed.state).toBe("running");
+
+    const directTask = await createTask(harness);
+    await manager.transitionTurn(directTask.allocation.task_id, 1, "running");
+    await expect(
+      manager.transitionTurn(
+        directTask.allocation.task_id,
+        1,
+        "waiting_for_input",
+      ),
+    ).rejects.toMatchObject({ code: "task_state_conflict" });
+    await expect(
+      waitForInput(manager, directTask.allocation.task_id),
+    ).resolves.toMatchObject({ state: "waiting_for_input" });
   });
 
   it("serializes concurrent updates to one task without losing event sequence", async () => {
